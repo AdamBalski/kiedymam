@@ -1,0 +1,87 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  system-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out selected commit
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system test dependencies
+        run: python -m pip install -r backend/requirements-system-test.txt
+      - name: Run repository and live workbook system tests
+        run: PYTHONPATH=backend python -m unittest discover -s tests -v
+
+  verify-image:
+    needs: system-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Confirm the tested image tag exists
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: docker manifest inspect "ghcr.io/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]'):${SHA}" >/dev/null
+
+  deploy:
+    needs: [system-test, verify-image]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Trust deploy host key
+        env:
+          DEPLOY_HOST: ${{ secrets.REMOTE_HOST }}
+          DEPLOY_PORT: ${{ secrets.REMOTE_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy tested image with Docker Compose
+        env:
+          DEPLOY_HOST: ${{ secrets.REMOTE_HOST }}
+          DEPLOY_PORT: ${{ secrets.REMOTE_PORT }}
+          DEPLOY_USER: ${{ secrets.REMOTE_USERNAME }}
+          SHA: ${{ github.sha }}
+          APP_ORIGIN: ${{ vars.APP_ORIGIN }}
+          APP_BASE_PATH: ${{ vars.APP_BASE_PATH }}
+          OCI_SECRET_OCID: ${{ vars.OCI_SECRET_OCID }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          GOOGLE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_OAUTH_CLIENT_JSON }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'export DEPLOY_USER=%q\n' "$DEPLOY_USER"
+            printf 'export UMB_SYNCER_VERSION=%q\n' "$SHA"
+            printf 'export APP_ORIGIN=%q\n' "$APP_ORIGIN"
+            printf 'export APP_BASE_PATH=%q\n' "$APP_BASE_PATH"
+            printf 'export OCI_SECRET_OCID=%q\n' "$OCI_SECRET_OCID"
+            printf 'export LOG_LEVEL=%q\n' "${LOG_LEVEL:-INFO}"
+            printf 'export GOOGLE_OAUTH_CLIENT_JSON=%q\n' "$GOOGLE_OAUTH_CLIENT_JSON"
+            cat <<'REMOTE'
+          set -euo pipefail
+          compose_file="/home/${DEPLOY_USER}/infra/compose/umb-syncer.yml"
+          docker compose -f "$compose_file" pull
+          docker compose -f "$compose_file" up -d --no-build --wait
+          REMOTE
+          } | ssh -p "${DEPLOY_PORT:-22}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -s"

@@ -1,0 +1,30 @@
+services:
+  umb-syncer:
+    image: ghcr.io/adambalski/umb-syncer:${UMB_SYNCER_VERSION:-latest}
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HOST: 127.0.0.1
+      PORT: 8080
+      DATABASE_PATH: /data/umb-syncer.sqlite3
+      APP_ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN to the public HTTPS origin}
+      APP_BASE_PATH: ${APP_BASE_PATH:-}
+      GOOGLE_OAUTH_CLIENT_JSON: ${GOOGLE_OAUTH_CLIENT_JSON:?Set GOOGLE_OAUTH_CLIENT_JSON}
+      OCI_SECRET_OCID: ${OCI_SECRET_OCID:?Set OCI_SECRET_OCID}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - umb-syncer-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  umb-syncer-data:
