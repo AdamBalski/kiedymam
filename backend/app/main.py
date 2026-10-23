@@ -20,6 +20,9 @@ from app.limits.admission import BoundedAdmissionMiddleware
 
 LOG = logging.getLogger("umb_syncer")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+SOURCE_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if not (STATIC_DIR / "index.html").is_file() and (SOURCE_FRONTEND_DIR / "index.html").is_file():
+    STATIC_DIR = SOURCE_FRONTEND_DIR
 
 
 @asynccontextmanager
