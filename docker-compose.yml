@@ -1,6 +1,6 @@
 services:
   umb-syncer:
-    image: ghcr.io/adambalski/umb-syncer:${UMB_SYNCER_VERSION:-latest}
+    image: ghcr.io/adambalski/kiedymam:${UMB_SYNCER_VERSION:-latest}
     build: .
     restart: unless-stopped
     network_mode: host
