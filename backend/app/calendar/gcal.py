@@ -21,7 +21,8 @@ TIME_ZONE = "Europe/Warsaw"
 
 def _credentials(user_id: str, repository: Repository, crypto: EnvelopeCrypto) -> Credentials:
     payload = load_credentials(crypto, user_id)
-    expiry = datetime.fromtimestamp(int(payload.get("expires_at", 0)), timezone.utc)
+    # google-auth expects a naive UTC expiry and compares it with utcnow().
+    expiry = datetime.fromtimestamp(int(payload.get("expires_at", 0)), timezone.utc).replace(tzinfo=None)
     credentials = Credentials(
         token=payload.get("access_token"),
         refresh_token=payload.get("refresh_token"),
