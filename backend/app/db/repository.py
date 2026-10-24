@@ -23,6 +23,34 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_feedback(self, user_id: str) -> dict | None:
+        with self.database.read() as db:
+            row = db.execute(
+                "SELECT body,created_at,updated_at FROM user_feedback WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_feedback(self, user_id: str, body: str) -> dict:
+        now = utc_now()
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO user_feedback(user_id,body,created_at,updated_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(user_id) DO UPDATE SET body=excluded.body,updated_at=excluded.updated_at""",
+                (user_id, body, now, now),
+            )
+            row = db.execute(
+                "SELECT body,created_at,updated_at FROM user_feedback WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+        return dict(row)
+
+    def delete_feedback(self, user_id: str) -> bool:
+        with self.database.transaction(immediate=True) as db:
+            cursor = db.execute("DELETE FROM user_feedback WHERE user_id=?", (user_id,))
+        return cursor.rowcount > 0
+
     def get_integration(self, integration_id: str, user_id: str | None = None) -> dict | None:
         sql = "SELECT * FROM integrations WHERE id=?"
         args: tuple = (integration_id,)
@@ -327,18 +355,22 @@ class Repository:
             )
         return item
 
-    def save_push_subscription(self, user_id: str, subscription: dict, user_agent: str, crypto) -> str:
+    def save_push_subscription(
+        self, user_id: str, subscription: dict, user_agent: str, crypto,
+        device_name: str = "",
+    ) -> str:
         endpoint = subscription["endpoint"]
         endpoint_hash = sha256(endpoint.encode("utf-8")).hexdigest()
         nonce, ciphertext = crypto.encrypt_payload(user_id, f"push:{endpoint_hash}", subscription)
         subscription_id = str(uuid.uuid4())
         with self.database.transaction(immediate=True) as db:
             db.execute(
-                """INSERT INTO push_subscriptions(id,user_id,endpoint_hash,nonce,ciphertext,user_agent,created_at)
-                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(endpoint_hash) DO UPDATE SET
+                """INSERT INTO push_subscriptions(id,user_id,endpoint_hash,nonce,ciphertext,user_agent,device_name,created_at)
+                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(endpoint_hash) DO UPDATE SET
                    user_id=excluded.user_id,nonce=excluded.nonce,ciphertext=excluded.ciphertext,
-                   user_agent=excluded.user_agent,created_at=excluded.created_at""",
-                (subscription_id, user_id, endpoint_hash, nonce, ciphertext, user_agent[:300], utc_now()),
+                   user_agent=excluded.user_agent,device_name=excluded.device_name,created_at=excluded.created_at""",
+                (subscription_id, user_id, endpoint_hash, nonce, ciphertext,
+                 user_agent[:300], device_name[:80], utc_now()),
             )
             row = db.execute("SELECT id FROM push_subscriptions WHERE endpoint_hash=?", (endpoint_hash,)).fetchone()
         return row["id"]
@@ -350,7 +382,7 @@ class Repository:
             ).fetchall()
         return [{
             "id": row["id"], "user_id": user_id, "created_at": row["created_at"],
-            "user_agent": row["user_agent"],
+            "user_agent": row["user_agent"], "device_name": row["device_name"],
             "subscription": crypto.decrypt_payload(
                 user_id, f"push:{row['endpoint_hash']}", bytes(row["nonce"]), bytes(row["ciphertext"])
             ),

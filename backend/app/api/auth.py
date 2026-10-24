@@ -37,9 +37,12 @@ def require_csrf(request: Request) -> None:
 
 
 @router.get("/google")
-async def start_google_login(request: Request):
+async def start_google_login(request: Request, return_path: str = "/"):
     settings, database, _ = get_services(request)
-    state, nonce = google.new_oauth_state(database)
+    # Keep sign-in returns on known same-origin app routes.
+    if return_path not in ("/", "/?tab=contact"):
+        return_path = "/"
+    state, nonce = google.new_oauth_state(database, return_path)
     client = settings.google_client["web"]
     params = {
         "client_id": client["client_id"],

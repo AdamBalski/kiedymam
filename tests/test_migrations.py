@@ -25,10 +25,14 @@ class MigrationTests(unittest.TestCase):
             versions = [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")]
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4, 5])
         self.assertIn("users", tables)
         self.assertIn("timetable_links", tables)
         self.assertIn("push_subscriptions", tables)
+        self.assertIn("user_feedback", tables)
+        with self.database.read() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(push_subscriptions)")}
+        self.assertIn("device_name", columns)
 
     def test_upgrades_a_database_created_with_the_previous_schema(self):
         first_migration = Database._load_migrations()[0]
@@ -43,7 +47,10 @@ class MigrationTests(unittest.TestCase):
             self.assertIsNotNone(
                 db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='timetable_links'").fetchone()
             )
-            self.assertEqual(versions, [1, 2, 3])
+            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertIsNotNone(
+                db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_feedback'").fetchone()
+            )
 
     def test_refuses_to_change_an_already_applied_migration(self):
         self.database.initialize()

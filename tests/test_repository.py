@@ -172,11 +172,12 @@ class RepositoryTests(unittest.TestCase):
             "keys": {"p256dh": "p256dh-secret", "auth": "auth-secret"},
         }
         subscription_id = self.repository.save_push_subscription(
-            "user-1", subscription, "Browser", crypto
+            "user-1", subscription, "Browser", crypto, "My laptop"
         )
         records = self.repository.push_subscriptions("user-1", crypto)
         self.assertEqual(records[0]["id"], subscription_id)
         self.assertEqual(records[0]["subscription"], subscription)
+        self.assertEqual(records[0]["device_name"], "My laptop")
         self.assertTrue(self.repository.delete_push_subscription(subscription_id, "user-1"))
         self.assertEqual(self.repository.push_subscriptions("user-1", crypto), [])
 

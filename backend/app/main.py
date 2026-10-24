@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, integrations, notifications, push
+from app.api import auth, feedback, integrations, notifications, push
 from app.api import timetable_links
 from app.calendar.catalog import TimetableCatalog
 from app.calendar.service import CalendarService
@@ -62,6 +62,7 @@ app = FastAPI(title="KiedyMam", docs_url=None, redoc_url=None, lifespan=lifespan
 app.add_middleware(BoundedAdmissionMiddleware, workers=16, queue_size=128)
 app.include_router(auth.router)
 app.include_router(integrations.router)
+app.include_router(feedback.router)
 app.include_router(notifications.router)
 app.include_router(timetable_links.router)
 app.include_router(push.router)

@@ -29,7 +29,7 @@ function triggerLabel(value) {
     integration_changed: "Zmiana ustawień", integration_deleted: "Usunięcie integracji" })[value] || value;
 }
 
-function LoginPage() {
+function LoginPage({ returnPath = "/" }) {
   return (
     <section className="login-panel">
       <h2>Plan zajęć UMB</h2>
@@ -41,11 +41,95 @@ function LoginPage() {
         Do utworzenia osobnego kalendarza wymagana jest zgoda Google na tworzenie
         kalendarzy. Jeśli jej nie udzielisz, logowanie nie zostanie zakończone.
       </p>
-      <a className="button primary" href={appPath("/api/auth/google")}>Zaloguj się przez Google</a>
+      <a className="button primary" href={appPath(`/api/auth/google?return_path=${encodeURIComponent(returnPath)}`)}>Zaloguj się przez Google</a>
       <p className="muted">
         Aplikacja utworzy osobny kalendarz na Twoim koncie Google. Nie zmienia
         Twojego głównego kalendarza.
       </p>
+    </section>
+  );
+}
+
+function ContactPage({ setError }) {
+  const [body, setBody] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    api.feedback()
+      .then((feedback) => {
+        setBody(feedback?.body || "");
+        setSaved(Boolean(feedback));
+      })
+      .catch((error) => setError(error.message))
+      .finally(() => setLoading(false));
+  }, [setError]);
+
+  async function submit(event) {
+    event.preventDefault();
+    setSaving(true);
+    setMessage("");
+    setError("");
+    try {
+      await api.saveFeedback(body);
+      setSaved(true);
+      setMessage("Wiadomość została wysłana. Możesz ją później zmienić lub usunąć.");
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove() {
+    setRemoving(true);
+    setMessage("");
+    setError("");
+    try {
+      await api.deleteFeedback();
+      setBody("");
+      setSaved(false);
+      setMessage("Twoja wiadomość została usunięta.");
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  return (
+    <section>
+      <h2>Kontakt z twórcą</h2>
+      <p>Przekaż opinię, pochwałę, pytanie lub propozycję funkcji. Możesz ją później zmienić albo usunąć.</p>
+      <p className="muted">Przechowujemy tylko Twoją aktualną wiadomość. Zapisanie zmian zastępuje poprzednią treść.</p>
+      {message && <div className="message success" role="status">{message}</div>}
+      {loading ? <p>Ładowanie…</p> : (
+        <form onSubmit={submit} className="feedback-form">
+          <label htmlFor="creator-feedback">Twoja wiadomość</label>
+          <textarea
+            id="creator-feedback"
+            value={body}
+            rows={10}
+            onChange={(event) => {
+              const characters = Array.from(event.target.value);
+              setBody(characters.length <= 3000 ? event.target.value : characters.slice(0, 3000).join(""));
+            }}
+            aria-describedby="feedback-count"
+          />
+          <p id="feedback-count" className="muted">{Array.from(body).length}/3000 znaków</p>
+          <div className="button-row">
+            <button type="submit" disabled={saving || removing || body.length === 0}>
+              {saving ? "Wysyłanie…" : saved ? "Zapisz zmiany i wyślij" : "Wyślij"}
+            </button>
+            {saved && <button type="button" className="secondary" onClick={remove} disabled={saving || removing}>
+              {removing ? "Usuwanie…" : "Usuń wiadomość"}
+            </button>}
+          </div>
+        </form>
+      )}
     </section>
   );
 }
@@ -353,12 +437,18 @@ function SchedulePage({ integration, onChanged, setError, setSuccess }) {
   );
 }
 
-function NotificationsPage({ onSubscribe, subscribing }) {
+function NotificationsPage({ onSubscribe, subscribing, setError: setGlobalError, setSuccess }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState("");
+  const [innerTab, setInnerTab] = useState("notifications");
+  const [devices, setDevices] = useState([]);
+  const [devicesLoading, setDevicesLoading] = useState(true);
+  const [currentEndpointHash, setCurrentEndpointHash] = useState("");
+  const [deviceName, setDeviceName] = useState("Moje urządzenie");
+  const [removingDevice, setRemovingDevice] = useState("");
 
   async function reload(append = false) {
     const offset = append ? items.length : 0;
@@ -377,6 +467,80 @@ function NotificationsPage({ onSubscribe, subscribing }) {
   }
 
   useEffect(() => { reload(); }, []);
+
+  async function reloadDevices() {
+    setDevicesLoading(true);
+    try {
+      const records = await api.pushSubscriptions();
+      setDevices(records);
+      const registration = await navigator.serviceWorker?.getRegistration(appPath("/"));
+      const subscription = await registration?.pushManager.getSubscription();
+      const hash = subscription ? await endpointHash(subscription.endpoint) : "";
+      setCurrentEndpointHash(hash);
+      const current = records.find((device) => device.endpoint_hash === hash);
+      if (current?.device_name) setDeviceName(current.device_name);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setDevicesLoading(false);
+    }
+  }
+
+  useEffect(() => { reloadDevices(); }, []);
+
+  const currentDevice = devices.find((device) => device.endpoint_hash === currentEndpointHash);
+
+  async function togglePush() {
+    if (!currentDevice) {
+      if (!deviceName.trim()) {
+        setGlobalError("Wpisz nazwę tego urządzenia.");
+        return;
+      }
+      await onSubscribe(deviceName.trim(), reloadDevices);
+      return;
+    }
+
+    setRemovingDevice(currentDevice.id);
+    setGlobalError("");
+    try {
+      await api.deletePushSubscription(currentDevice.id);
+      try {
+        const registration = await navigator.serviceWorker?.getRegistration(appPath("/"));
+        const subscription = await registration?.pushManager.getSubscription();
+        if (subscription && await endpointHash(subscription.endpoint) === currentEndpointHash) {
+          await subscription.unsubscribe();
+        }
+      } catch { /* The server-side subscription has already been removed. */ }
+      await reloadDevices();
+      setSuccess("To urządzenie nie będzie już otrzymywać powiadomień push.");
+    } catch (error) {
+      setGlobalError(error.message);
+    } finally {
+      setRemovingDevice("");
+    }
+  }
+
+  async function removeDevice(id) {
+    setRemovingDevice(id);
+    setGlobalError("");
+    try {
+      const device = devices.find((item) => item.id === id);
+      await api.deletePushSubscription(id);
+      try {
+        const registration = await navigator.serviceWorker?.getRegistration(appPath("/"));
+        const subscription = await registration?.pushManager.getSubscription();
+        if (subscription && device?.endpoint_hash === await endpointHash(subscription.endpoint)) {
+          await subscription.unsubscribe();
+        }
+      } catch { /* The server-side subscription has already been removed. */ }
+      await reloadDevices();
+      setSuccess("Usunięto subskrypcję tego urządzenia.");
+    } catch (error) {
+      setGlobalError(error.message);
+    } finally {
+      setRemovingDevice("");
+    }
+  }
 
   async function markRead(id) {
     try {
@@ -398,15 +562,33 @@ function NotificationsPage({ onSubscribe, subscribing }) {
 
   return (
     <section>
-      <div className="section-heading">
-        <div><h2>Powiadomienia</h2><p>Zmiany planu z ostatnich siedmiu dni.</p></div>
-        <div className="button-row">
-          <button type="button" onClick={onSubscribe} disabled={subscribing}>{subscribing ? "Włączanie…" : "Subskrybuj powiadomienia push"}</button>
-          <button type="button" className="secondary" onClick={markAllRead}>Oznacz wszystkie jako przeczytane</button>
-        </div>
+      <div className="nav-links inner-tabs" role="tablist" aria-label="Powiadomienia i urządzenia">
+        <button type="button" role="tab" aria-selected={innerTab === "notifications"} className={innerTab === "notifications" ? "nav-active" : "nav-link"} onClick={() => setInnerTab("notifications")}>Powiadomienia</button>
+        <button type="button" role="tab" aria-selected={innerTab === "devices"} className={innerTab === "devices" ? "nav-active" : "nav-link"} onClick={() => setInnerTab("devices")}>Urządzenia push</button>
       </div>
       {error && <Message error={error} />}
-      {loading ? <p>Ładowanie…</p> : items.length === 0 ? <p>Brak powiadomień.</p> : (
+      {innerTab === "notifications" ? <>
+        <div className="section-heading">
+          <div><h2>Powiadomienia</h2><p>Zmiany planu z ostatnich siedmiu dni.</p></div>
+          <button type="button" className="secondary" onClick={markAllRead}>Oznacz wszystkie jako przeczytane</button>
+        </div>
+        <div className="card push-status">
+          {devicesLoading ? <p>Sprawdzanie tego urządzenia…</p> : currentDevice ? <>
+            <p><strong>To urządzenie subskrybuje powiadomienia push</strong></p>
+            <p className="muted">Nazwa: {currentDevice.device_name || "Urządzenie bez nazwy"}</p>
+            <button type="button" className="secondary" onClick={togglePush} disabled={Boolean(removingDevice)}>
+              {removingDevice === currentDevice.id ? "Wyłączanie…" : "Przestań subskrybować powiadomienia push"}
+            </button>
+          </> : <>
+            <p><strong>To urządzenie nie subskrybuje powiadomień push.</strong></p>
+            <label htmlFor="push-device-name">Nazwa tego urządzenia</label>
+            <input id="push-device-name" value={deviceName} maxLength={80} onChange={(event) => setDeviceName(event.target.value)} />
+            <button type="button" onClick={togglePush} disabled={subscribing || Boolean(removingDevice)}>
+              {subscribing ? "Włączanie…" : "Subskrybuj powiadomienia push"}
+            </button>
+          </>}
+        </div>
+        {loading ? <p>Ładowanie…</p> : items.length === 0 ? <p>Brak powiadomień.</p> : (
         <div className="list">
           {items.map((item) => (
             <article className={`card notice ${item.read_at ? "read" : "unread"}`} key={item.id}>
@@ -417,48 +599,23 @@ function NotificationsPage({ onSubscribe, subscribing }) {
             </article>
           ))}
         </div>
-      )}
-      {!loading && hasMore && <button type="button" onClick={() => reload(true)} disabled={loadingMore}>{loadingMore ? "Ładowanie…" : "Załaduj starsze powiadomienia"}</button>}
+        )}
+        {!loading && hasMore && <button type="button" onClick={() => reload(true)} disabled={loadingMore}>{loadingMore ? "Ładowanie…" : "Załaduj starsze powiadomienia"}</button>}
+      </> : <PushSettingsPage devices={devices} loading={devicesLoading} currentEndpointHash={currentEndpointHash} removing={removingDevice} onRemove={removeDevice} />}
     </section>
   );
 }
 
-function PushSettingsPage({ setError, setSuccess }) {
-  const [devices, setDevices] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [removing, setRemoving] = useState("");
-  async function reload() {
-    try { setDevices(await api.pushSubscriptions()); }
-    catch (error) { setError(error.message); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { reload(); }, []);
-  async function remove(id) {
-    setRemoving(id);
-    setError("");
-    try {
-      const device = devices.find((item) => item.id === id);
-      try {
-        const registration = await navigator.serviceWorker?.getRegistration(appPath("/"));
-        const subscription = await registration?.pushManager.getSubscription();
-        if (subscription && device?.endpoint_hash === await endpointHash(subscription.endpoint)) {
-          await subscription.unsubscribe();
-        }
-      } catch { /* Server-side removal remains available if browser cleanup fails. */ }
-      await api.deletePushSubscription(id);
-      await reload();
-      setSuccess("Usunięto subskrypcję tego urządzenia.");
-    } catch (error) { setError(error.message); }
-    finally { setRemoving(""); }
-  }
+function PushSettingsPage({ devices, loading, currentEndpointHash, removing, onRemove }) {
   return <section>
     <h2>Urządzenia z powiadomieniami push</h2>
     <p>Każda pozycja to przeglądarka lub urządzenie subskrybujące powiadomienia.</p>
     {loading ? <p>Ładowanie…</p> : devices.length === 0 ? <p>Brak aktywnych subskrypcji.</p> : <div className="list">
       {devices.map((device) => <article className="card" key={device.id}>
-        <p><strong>{device.user_agent || "Przeglądarka"}</strong></p>
+        <p><strong>{device.device_name || "Urządzenie bez nazwy"}</strong>{device.endpoint_hash === currentEndpointHash && <span className="device-current"> To urządzenie</span>}</p>
+        <p className="muted device-agent">{device.user_agent || "Przeglądarka"}</p>
         <p className="muted">Dodano: {dateTime(device.created_at)}</p>
-        <button type="button" className="secondary" onClick={() => remove(device.id)} disabled={removing === device.id}>{removing === device.id ? "Usuwanie…" : "Usuń urządzenie"}</button>
+        <button type="button" className="secondary" onClick={() => onRemove(device.id)} disabled={removing === device.id}>{removing === device.id ? "Usuwanie…" : "Usuń urządzenie"}</button>
       </article>)}
     </div>}
     <p className="muted">Na iPhonie i iPadzie web push działa po dodaniu KiedyMam do ekranu początkowego (iOS/iPadOS 16.4 lub nowszy).</p>
@@ -544,7 +701,7 @@ export default function App() {
     }
   }
 
-  async function subscribeToPush() {
+  async function subscribeToPush(deviceName, afterSubscribed) {
     setSubscribing(true);
     setError("");
     setSuccess("");
@@ -563,10 +720,25 @@ export default function App() {
       const ready = await navigator.serviceWorker.ready;
       const pushManager = ready.pushManager || registration.pushManager;
       let subscription = await pushManager.getSubscription();
-      if (!subscription) subscription = await pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: applicationServerKey(config.public_key) });
-      await api.savePushSubscription(subscription.toJSON());
+      if (!subscription) {
+        try {
+          subscription = await pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: applicationServerKey(config.public_key),
+          });
+        } catch (error) {
+          const reason = `${error?.name || ""} ${error?.message || ""}`.toLowerCase();
+          if (reason.includes("aborterror") || reason.includes("push service error")) {
+            throw new Error(
+              "Przeglądarka nie mogła połączyć się ze swoją usługą powiadomień push. Może ona nie obsługiwać Web Push albo mieć wyłączoną usługę push. W Brave otwórz brave://settings/privacy, włącz „Use Google services for push messaging”, uruchom ponownie przeglądarkę i spróbuj ponownie.",
+            );
+          }
+          throw error;
+        }
+      }
+      await api.savePushSubscription(subscription.toJSON(), deviceName);
       setSuccess("To urządzenie będzie otrzymywać powiadomienia push.");
-      setTab("push");
+      await afterSubscribed();
     } catch (error) { setError(error.message); }
     finally { setSubscribing(false); }
   }
@@ -582,11 +754,11 @@ export default function App() {
       {error && <Message error={error} />}
       {success && <Message success={success} />}
 
-      {!user ? <LoginPage /> : (
+      {!user ? (tab === "contact" ? null : <LoginPage />) : (
         <>
           <nav className="nav" aria-label="Główna nawigacja">
             <div className="nav-links">
-              {[ ["plan", "Plan"], ["notifications", "Powiadomienia"], ["push", "Urządzenia push"], ["changelog", "Dziennik zmian"] ].map(([key, label]) => (
+              {[ ["plan", "Plan"], ["notifications", "Powiadomienia"], ["changelog", "Dziennik zmian"], ["contact", "Kontakt z twórcą"] ].map(([key, label]) => (
                 <button type="button" className={tab === key ? "nav-active" : "nav-link"} key={key} onClick={() => { setTab(key); setError(""); setSuccess(""); }}>{label}</button>
               ))}
             </div>
@@ -609,14 +781,25 @@ export default function App() {
               )}
             </section>
           )}
-          {tab === "notifications" && <NotificationsPage onSubscribe={subscribeToPush} subscribing={subscribing} />}
-          {tab === "push" && <PushSettingsPage setError={setError} setSuccess={setSuccess} />}
+          {tab === "notifications" && <NotificationsPage onSubscribe={subscribeToPush} subscribing={subscribing} setError={setError} setSuccess={setSuccess} />}
           {tab === "changelog" && <ChangelogPage />}
+          {tab === "contact" && <ContactPage setError={setError} />}
+        </>
+      )}
+      {!user && tab === "contact" && (
+        <>
+          <h2>Kontakt z twórcą</h2>
+          <p>Zaloguj się przez Google, aby wysłać wiadomość i móc ją później edytować lub usunąć.</p>
+          <LoginPage returnPath="/?tab=contact" />
         </>
       )}
       <footer className="site-footer">
         <p>Plany pochodzą z oficjalnej strony UMB. Zmiany sprawdzane są co 30 minut.</p>
-        <p><a href={appPath("/privacy")}>Polityka prywatności</a> · <a href={appPath("/terms")}>Warunki korzystania</a></p>
+        <p>
+          <button type="button" className="footer-link" onClick={() => { setTab("contact"); setError(""); setSuccess(""); }}>Kontakt z twórcą</button>
+          {" · "}<a href={appPath("/privacy")}>Polityka prywatności</a>
+          {" · "}<a href={appPath("/terms")}>Warunki korzystania</a>
+        </p>
       </footer>
     </main>
   );

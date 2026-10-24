@@ -44,9 +44,14 @@ export const api = {
   notifications: ({ limit = 100, offset = 0 } = {}) => request(`/api/notifications?limit=${limit}&offset=${offset}`),
   pushConfig: () => request("/api/push/config"),
   pushSubscriptions: () => request("/api/push/subscriptions"),
-  savePushSubscription: (body) => request("/api/push/subscriptions", { method: "POST", body }),
+  savePushSubscription: (subscription, deviceName) => request("/api/push/subscriptions", {
+    method: "POST", body: { ...subscription, device_name: deviceName },
+  }),
   deletePushSubscription: (id) => request(`/api/push/subscriptions/${encodeURIComponent(id)}`, { method: "DELETE" }),
   markRead: (id) => request(`/api/notifications/${encodeURIComponent(id)}/read`, { method: "POST" }),
   markAllRead: () => request("/api/notifications/read-all", { method: "POST" }),
+  feedback: () => request("/api/feedback"),
+  saveFeedback: (body) => request("/api/feedback", { method: "PUT", body: { body } }),
+  deleteFeedback: () => request("/api/feedback", { method: "DELETE" }),
   changelog: () => request("/api/changelog"),
 };

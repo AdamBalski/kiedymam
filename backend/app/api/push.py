@@ -20,6 +20,7 @@ class PushKeys(BaseModel):
 class SubscriptionRequest(BaseModel):
     endpoint: str = Field(min_length=20, max_length=4096)
     keys: PushKeys
+    device_name: str = Field(default="", max_length=80)
 
 
 @router.get("/config")
@@ -33,7 +34,8 @@ async def push_config(request: Request, user: dict = Depends(current_user)) -> d
 async def list_subscriptions(request: Request, user: dict = Depends(current_user)) -> list[dict]:
     repository, crypto = request.app.state.repository, request.app.state.crypto
     return [{
-        "id": item["id"], "created_at": item["created_at"], "user_agent": item["user_agent"],
+        "id": item["id"], "created_at": item["created_at"],
+        "device_name": item["device_name"], "user_agent": item["user_agent"],
         "endpoint_hash": sha256(item["subscription"].get("endpoint", "").encode("utf-8")).hexdigest(),
     } for item in repository.push_subscriptions(user["id"], crypto)]
 
@@ -56,7 +58,9 @@ async def create_subscription(
     ):
         raise HTTPException(status_code=400, detail="Unsupported push service endpoint")
     subscription_id = request.app.state.repository.save_push_subscription(
-        user["id"], payload.model_dump(), request.headers.get("user-agent", ""), request.app.state.crypto
+        user["id"], payload.model_dump(exclude={"device_name"}),
+        request.headers.get("user-agent", ""), request.app.state.crypto,
+        payload.device_name.strip(),
     )
     return {"id": subscription_id, "saved": True}
 
