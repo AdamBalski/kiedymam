@@ -3,7 +3,6 @@ export default function MainNavigation({ tab, setTab, email, onLogout, clearMess
     ["plan", "Plan"],
     ["notifications", "Powiadomienia"],
     ["changelog", "Dziennik zmian"],
-    ["contact", "Kontakt z twórcą"],
   ];
 
   function selectPage(nextTab) {

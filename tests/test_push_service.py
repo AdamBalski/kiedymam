@@ -50,6 +50,20 @@ class PushServiceTests(unittest.TestCase):
         self.assertEqual(len(base64.urlsafe_b64decode(public_value + "=")), 65)
         self.assertEqual(public_value[0], "B")
 
+    def test_disables_push_for_https_subjects_with_a_path(self):
+        settings = SimpleNamespace(
+            web_push_secret_ocid="ocid1.secret",
+            web_push_subject="https://example.org/kiedymam",
+            app_origin="https://example.org",
+            app_base_path="/kiedymam",
+        )
+
+        with patch.object(EnvelopeCrypto, "load_secret_value") as load:
+            service = PushService(repository=None, crypto=None, settings=settings)
+
+        load.assert_not_called()
+        self.assertFalse(service.configured)
+
     def test_rejects_invalid_vapid_private_secret(self):
         with self.assertRaisesRegex(ValueError, "VAPID secret"):
             PushService.derive_vapid_keys(b"not-a-private-key")

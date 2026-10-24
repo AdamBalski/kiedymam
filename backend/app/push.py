@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 import logging
 import re
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -15,16 +16,48 @@ from app.db.repository import Repository
 LOG = logging.getLogger(__name__)
 
 
+def _valid_vapid_subject(value: str) -> bool:
+    """Match the subject URI forms accepted by py-vapid's strict validator."""
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return False
+
+    if parts.scheme.lower() == "mailto":
+        return bool(parts.path and "@" in parts.path and not any(char.isspace() for char in parts.path))
+    return bool(
+        parts.scheme.lower() == "https"
+        and host
+        and port is None
+        and not parts.username
+        and not parts.password
+        and not parts.path
+        and not parts.query
+        and not parts.fragment
+    )
+
+
 class PushService:
     def __init__(self, repository: Repository, crypto: EnvelopeCrypto, settings):
         self.repository = repository
         self.crypto = crypto
         self.private_key = None
         self.public_key = None
-        if settings.web_push_secret_ocid:
+        self.subject = (settings.web_push_subject or "").strip()
+        self.subject_valid = _valid_vapid_subject(self.subject)
+        if settings.web_push_secret_ocid and self.subject_valid:
             secret = EnvelopeCrypto.load_secret_value(settings.web_push_secret_ocid)
             self.private_key, self.public_key = self.derive_vapid_keys(secret)
-        self.subject = settings.web_push_subject
+            LOG.info("Web Push VAPID key and subject configured")
+        elif settings.web_push_secret_ocid:
+            LOG.error(
+                "Web Push delivery disabled; WEB_PUSH_VAPID_SUBJECT must be a mailto URI "
+                "or an HTTPS origin without a path"
+            )
+        else:
+            LOG.warning("Web Push delivery disabled; OCI_WEB_PUSH_VAPID_SECRET_OCID is empty")
         self.public_url = settings.app_origin + settings.app_base_path + "/?tab=notifications"
 
     @staticmethod
@@ -63,7 +96,7 @@ class PushService:
 
     @property
     def configured(self) -> bool:
-        return bool(self.public_key and self.private_key)
+        return bool(self.subject_valid and self.public_key and self.private_key)
 
     def send_notifications(self, notifications: list[dict]) -> None:
         if not notifications or not self.configured:

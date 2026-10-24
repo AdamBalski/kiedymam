@@ -102,7 +102,7 @@ def load_settings() -> Settings:
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         web_push_secret_ocid=os.environ.get("OCI_WEB_PUSH_VAPID_SECRET_OCID", "").strip(),
         web_push_subject=os.environ.get(
-            "WEB_PUSH_VAPID_SUBJECT", "https://adam-balski.duckdns.org/kiedymam"
+            "WEB_PUSH_VAPID_SUBJECT", "https://change.me"
         ).strip(),
     )
 
