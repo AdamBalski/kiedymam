@@ -136,15 +136,34 @@ class ReconciliationTests(unittest.TestCase):
                 crypto=None,
             )
 
-        self.assertEqual(first, {"added_or_updated": 2, "removed": 0})
-        self.assertEqual(second, {"added_or_updated": 1, "removed": 1})
-        self.assertEqual(repeated, {"added_or_updated": 0, "removed": 0})
+        self.assertEqual((first["added_or_updated"], first["removed"]), (2, 0))
+        self.assertEqual((second["added_or_updated"], second["removed"]), (1, 1))
+        self.assertEqual((repeated["added_or_updated"], repeated["removed"]), (0, 0))
+        self.assertEqual(len(first["notifications"]), 2)
+        self.assertEqual(len(second["notifications"]), 2)
+        self.assertEqual(repeated["notifications"], [])
         self.assertEqual(self.google.calendar_summary, self.integration["calendar_name"])
         self.assertEqual(len(self.google.events_by_id), 1)
         local = self.repository.get_calendar_events(self.integration["id"])
         self.assertEqual(len(local), 1)
         self.assertEqual(next(iter(local.values()))["event"]["schedule"]["summary"], "Anatomia poprawiona")
         self.assertEqual(len(self.repository.notifications("user-1")), 4)
+
+    def test_calendar_rename_updates_metadata_without_changing_events(self):
+        event = {
+            "event_key": "event-a", "date": "2026-10-26", "start": "08:00", "end": "08:45",
+            "summary": "Anatomia", "source_text": "Anatomia", "group_numbers": [1], "all_groups": False,
+        }
+        with patch("app.calendar.reconcile.gcal.calendar_api", return_value=self.google):
+            reconcile_integration(self.integration, {"events": [event]}, self.repository, crypto=None,
+                                  emit_notifications=False)
+            old_events = dict(self.google.events_by_id)
+            renamed = {**self.integration, "calendar_name": "Mój plan"}
+            result = reconcile_integration(renamed, {"events": [event]}, self.repository, crypto=None,
+                                           emit_notifications=False)
+        self.assertEqual((result["added_or_updated"], result["removed"]), (0, 0))
+        self.assertEqual(self.google.calendar_summary, "Mój plan")
+        self.assertEqual(self.google.events_by_id, old_events)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,13 @@ async def start_google_login(request: Request):
 
 
 @router.get("/google/callback")
-async def google_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+async def google_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    scope: str | None = None,
+):
     settings, database, crypto = get_services(request)
     if error or not code or not state:
         raise HTTPException(status_code=400, detail="Google sign-in was not completed")
@@ -65,6 +71,12 @@ async def google_callback(request: Request, code: str | None = None, state: str 
         raise HTTPException(status_code=400, detail="Sign-in state expired; try again")
     try:
         payload = await google.exchange_code(settings, code)
+        granted_scopes = set((payload.get("scope") or scope or "").split())
+        if google.CALENDAR_SCOPE not in granted_scopes:
+            return RedirectResponse(
+                f"{settings.public_url(oauth_state['return_path'])}?auth_error=calendar_permission_required",
+                status_code=303,
+            )
         claims = await google.verify_id_token(payload.get("id_token", ""), settings, oauth_state["nonce"])
         user_id = google.upsert_user(database, claims)
         client = settings.google_client["web"]
@@ -72,7 +84,7 @@ async def google_callback(request: Request, code: str | None = None, state: str 
             "client_id": client["client_id"],
             "client_secret": client["client_secret"],
             "token_uri": client["token_uri"],
-            "scopes": list(google.SCOPES),
+            "scopes": sorted(granted_scopes),
             "expires_at": int(time.time()) + int(payload.get("expires_in", 3600)),
         })
         google.store_oauth_credentials(database, crypto, user_id, payload)

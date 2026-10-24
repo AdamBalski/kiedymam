@@ -25,7 +25,7 @@ WEEKDAYS = {
 TIME_RANGE = re.compile(r"^\s*(\d{1,2})[.:](\d{2})\s*[-–]\s*(\d{1,2})[.:](\d{2})\s*$")
 LEADING_TIME_RANGE = re.compile(r"^\s*\d{1,2}[.:]\d{2}\s*[-–]\s*\d{1,2}[.:]\d{2}\s*(?:\([WSC]\)\s*)?", re.IGNORECASE)
 GROUP_PREFIX = re.compile(
-    r"^\s*(?P<label>S\s*\d{1,2}|\d{1,2}(?:\s*\.\s*)?\s*\(\s*\d{1,2}\s*\)|\d{1,2}(?:[.,]\d{1,2})+|\d{1,2})"
+    r"^\s*(?P<label>S\s*\d{1,3}|\d{1,3}(?:\s*\.\s*)?\s*\(\s*\d{1,3}\s*\)|\d{1,3}(?:[.,]\d{1,3})+|\d{1,3})"
     r"(?P<separator>\.)?\s+(?P<body>.+)$",
     re.IGNORECASE,
 )
@@ -93,7 +93,7 @@ def _base_group_numbers(value: object) -> list[int]:
     text = str(value).strip()
     if not text:
         return []
-    if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})+", text):
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3})+", text):
         parts = [int(part) for part in text.split(".")]
         for index in range(1, len(parts)):
             previous, current = parts[index - 1], parts[index]
@@ -101,8 +101,9 @@ def _base_group_numbers(value: object) -> list[int]:
             if previous >= 10 and previous % 10 == 9 and current == 2:
                 parts[index] = previous + 1
         return parts
-    if re.fullmatch(r"\d{1,2}", text):
-        return [int(text)]
+    if re.fullmatch(r"\d{1,3}", text):
+        number = int(text)
+        return [number] if 1 <= number <= 999 else []
     return []
 
 
@@ -163,7 +164,7 @@ def _groups_for_span(header_ranges: dict[int, list[tuple[int, int, object]]], mi
                 memberships.append(label_set)
         if memberships:
             selected.update(set.intersection(*memberships))
-    return sorted(group for group in selected if 1 <= group <= 36)
+    return sorted(group for group in selected if 1 <= group <= 999)
 
 
 def _groups_from_event_label(label: str | None) -> list[int]:
@@ -172,13 +173,13 @@ def _groups_from_event_label(label: str | None) -> list[int]:
     text = label.strip().upper()
     if text.startswith("S"):
         return sorted(_groups_from_header(text, 36))
-    match = re.fullmatch(r"(\d{1,2})\s*\.?\s*\(\s*(6|12|18|36)\s*\)", text)
+    match = re.fullmatch(r"(\d{1,3})\s*\.?\s*\(\s*(\d{1,3})\s*\)", text)
     if match:
         number, size = int(match.group(1)), int(match.group(2))
         if size == 6:
             return [number]
         return sorted(_groups_from_header(f"{number}({size})", size))
-    return sorted({int(value) for value in re.findall(r"\d+", text) if 1 <= int(value) <= 36})
+    return sorted({int(value) for value in re.findall(r"\d+", text) if 1 <= int(value) <= 999})
 
 
 def _changelog(workbook) -> list[dict]:
@@ -202,9 +203,9 @@ def _changelog(workbook) -> list[dict]:
     return entries
 
 
-def _date_headers(sheet, row_number: int) -> list[tuple[int, date]]:
+def _date_headers(sheet, row_number: int, max_column: int | None = None) -> list[tuple[int, date]]:
     headers: list[tuple[int, date]] = []
-    for col in range(2, sheet.max_column + 1):
+    for col in range(2, (max_column or sheet.max_column) + 1):
         parsed = _as_date(sheet.cell(row_number, col).value)
         if parsed:
             headers.append((col, parsed))
@@ -245,13 +246,14 @@ def _merged_bounds(sheet) -> dict[tuple[int, int], tuple[int, int]]:
     return bounds
 
 
-def parse_workbook(contents: bytes) -> dict:
+def parse_g0_workbook(contents: bytes) -> dict:
     try:
         workbook = load_workbook(BytesIO(contents), data_only=True, read_only=False)
     except Exception as exc:
         raise ScheduleParseError("The XLSX document could not be opened") from exc
 
     parsed: list[dict] = []
+    available_groups: set[int] = set()
     for sheet in workbook.worksheets:
         day_headers: list[tuple[int, str, list[tuple[int, date]]]] = []
         for row_number in range(1, sheet.max_row + 1):
@@ -268,6 +270,9 @@ def parse_workbook(contents: bytes) -> dict:
             section_end = day_headers[day_index + 1][0] - 1 if day_index + 1 < len(day_headers) else sheet.max_row
             group_rows = _group_rows(sheet, header_row, section_end)
             group_header_ranges = _group_header_ranges(sheet, group_rows, merged_bounds)
+            for group_size, ranges in group_header_ranges.items():
+                for _start, _end, label in ranges:
+                    available_groups.update(_groups_from_header(label, group_size))
             for row_number in range(header_row + 1, section_end + 1):
                 interval = _time_range(sheet.cell(row_number, 1).value)
                 if not interval:
@@ -323,6 +328,19 @@ def parse_workbook(contents: bytes) -> dict:
     result = {
         "events": sorted(unique.values(), key=lambda event: (event["date"], event["start"], event["sheet"], event["source_cell"])),
         "changelog": _changelog(workbook),
+        "_available_groups": sorted(available_groups),
     }
     workbook.close()
     return result
+
+
+def parse_workbook(contents: bytes) -> dict:
+    from app.calendar.parsers.registry import parse_workbook as parse_registered_workbook
+
+    return parse_registered_workbook(contents)
+
+
+def parse_workbook_with_format(contents: bytes, format_id: str) -> dict:
+    from app.calendar.parsers.registry import parse_workbook_with_format as parse_registered_format
+
+    return parse_registered_format(contents, format_id)

@@ -1,0 +1,12 @@
+{
+  "name": "KiedyMam",
+  "short_name": "KiedyMam",
+  "start_url": "./?tab=plan",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#222222",
+  "icons": [
+    { "src": "./kiedymam-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

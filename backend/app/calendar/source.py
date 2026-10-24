@@ -7,10 +7,10 @@ from urllib.parse import urlsplit, urlunsplit, urljoin
 
 import httpx
 
-from app.calendar.parser import parse_workbook
+from app.calendar.parsers.registry import parse_workbook_for_url
 
 LOG = logging.getLogger(__name__)
-MAX_XLSX_BYTES = 30 * 1024 * 1024
+MAX_XLSX_BYTES = 5 * 1024 * 1024
 
 
 def canonicalize_xlsx_url(value: str) -> str:
@@ -41,7 +41,7 @@ async def _download(url: str) -> bytes:
     current = url
     async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=5), follow_redirects=False) as client:
         for _ in range(4):
-            async with client.stream("GET", current, headers={"User-Agent": "UMB-Fizjoterapia-Calendar/0.1"}) as response:
+            async with client.stream("GET", current, headers={"User-Agent": "KiedyMam-UMB-Calendar/0.1"}) as response:
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("location")
                     if not location:
@@ -53,7 +53,14 @@ async def _download(url: str) -> bytes:
                 async for chunk in response.aiter_bytes():
                     content.extend(chunk)
                     if len(content) > MAX_XLSX_BYTES:
-                        raise ValueError("The XLSX workbook is larger than the 30 MB limit")
+                        LOG.warning(
+                            "Rejected UMB workbook that exceeded the download limit "
+                            "url=%s limit_bytes=%d received_at_least_bytes=%d",
+                            current,
+                            MAX_XLSX_BYTES,
+                            len(content),
+                        )
+                        raise ValueError("The XLSX workbook is larger than the 5 MiB limit")
                 data = bytes(content)
                 if not data.startswith(b"PK\x03\x04"):
                     raise ValueError("UMB did not return an XLSX workbook")
@@ -61,9 +68,20 @@ async def _download(url: str) -> bytes:
     raise ValueError("UMB returned too many redirects")
 
 
-async def fetch_and_parse(url: str) -> tuple[str, dict]:
+async def download_and_hash(url: str) -> tuple[str, bytes]:
     canonical = canonicalize_xlsx_url(url)
     contents = await _download(canonical)
     digest = sha256(contents).hexdigest()
-    parsed = await asyncio.to_thread(parse_workbook, contents)
+    return digest, contents
+
+
+async def parse_downloaded_source(contents: bytes, url: str) -> dict:
+    canonical = canonicalize_xlsx_url(url)
+    return await asyncio.to_thread(parse_workbook_for_url, contents, canonical)
+
+
+async def fetch_and_parse(url: str) -> tuple[str, dict]:
+    canonical = canonicalize_xlsx_url(url)
+    digest, contents = await download_and_hash(canonical)
+    parsed = await parse_downloaded_source(contents, canonical)
     return digest, parsed

@@ -63,6 +63,12 @@ def delete_calendar(user_id: str, calendar_id: str, repository: Repository, cryp
     calendar_api(user_id, repository, crypto).calendars().delete(calendarId=calendar_id).execute(num_retries=2)
 
 
+def rename_calendar(user_id: str, calendar_id: str, calendar_name: str, repository: Repository, crypto: EnvelopeCrypto) -> None:
+    calendar_api(user_id, repository, crypto).calendars().patch(
+        calendarId=calendar_id, body={"summary": calendar_name}
+    ).execute(num_retries=2)
+
+
 def event_identifier(integration_id: str, event_key: str) -> str:
     return sha256(f"{integration_id}:{event_key}".encode("utf-8")).hexdigest()
 
@@ -77,13 +83,13 @@ def event_body(integration: dict, schedule_event: dict) -> dict:
     description = "\n".join(
         (
             schedule_event.get("source_text", ""),
-            f"Grupa 6-osobowa: {integration['group_number']}",
+            f"Grupa: {integration['group_number']}",
             f"Plan: {integration['source_url']}",
         )
     )
     return {
         "id": event_id,
-        "summary": schedule_event.get("summary") or "Zajęcia fizjoterapii",
+        "summary": schedule_event.get("summary") or "Zajęcia UMB",
         "description": description,
         "start": {"dateTime": _local_datetime(schedule_event["date"], schedule_event["start"]), "timeZone": TIME_ZONE},
         "end": {"dateTime": _local_datetime(schedule_event["date"], schedule_event["end"]), "timeZone": TIME_ZONE},

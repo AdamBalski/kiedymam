@@ -12,6 +12,8 @@ LOG = logging.getLogger(__name__)
 
 
 def _applies_to_group(event: dict, group_number: int) -> bool:
+    if group_number == 0:
+        return bool(event.get("all_groups"))
     if event.get("all_groups"):
         return True
     return group_number in {int(value) for value in event.get("group_numbers", []) if str(value).isdigit()}
@@ -22,6 +24,9 @@ def reconcile_integration(
     parsed_source: dict,
     repository: Repository,
     crypto: EnvelopeCrypto,
+    *,
+    emit_notifications: bool = True,
+    sync_trigger: str = "scheduled",
 ) -> dict:
     group_number = int(integration["group_number"])
     selected = {
@@ -84,10 +89,18 @@ def reconcile_integration(
                 raise
         changes.append(("removed", prior["event"].get("schedule", {})))
 
-    repository.replace_calendar_events(integration, updated, changes)
+    notifications = repository.replace_calendar_events(
+        integration, updated, changes,
+        emit_notifications=emit_notifications,
+        sync_trigger=sync_trigger,
+    )
     LOG.info(
         "Calendar reconciliation complete integration=%s group=%s added_or_updated=%d removed=%d",
         integration["id"], group_number, sum(action != "removed" for action, _ in changes),
         sum(action == "removed" for action, _ in changes),
     )
-    return {"added_or_updated": sum(action != "removed" for action, _ in changes), "removed": sum(action == "removed" for action, _ in changes)}
+    return {
+        "added_or_updated": sum(action != "removed" for action, _ in changes),
+        "removed": sum(action == "removed" for action, _ in changes),
+        "notifications": notifications,
+    }

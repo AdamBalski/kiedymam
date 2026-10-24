@@ -14,6 +14,7 @@ from app.security import new_token, token_hash
 
 LOG = logging.getLogger(__name__)
 SCOPES = ("openid", "email", "profile", "https://www.googleapis.com/auth/calendar.app.created")
+CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.app.created"
 SESSION_DAYS = 30
 OAUTH_STATE_MINUTES = 10
 

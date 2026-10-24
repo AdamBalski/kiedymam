@@ -12,6 +12,10 @@ services:
       APP_BASE_PATH: ${APP_BASE_PATH:-}
       GOOGLE_OAUTH_CLIENT_JSON: ${GOOGLE_OAUTH_CLIENT_JSON:?Set GOOGLE_OAUTH_CLIENT_JSON}
       OCI_SECRET_OCID: ${OCI_SECRET_OCID:?Set OCI_SECRET_OCID}
+      OCI_WEB_PUSH_VAPID_SECRET_OCID: ${OCI_WEB_PUSH_VAPID_SECRET_OCID:-}
+      # JSON Map of degree names to timetables URLs
+      TIMETABLE_DIRECTORY_PAGES: "[]"
+      WEB_PUSH_VAPID_SUBJECT: ${WEB_PUSH_VAPID_SUBJECT:-https://change.me}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - umb-syncer-data:/data
@@ -20,11 +24,14 @@ services:
         - CMD
         - python
         - -c
-        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/health', timeout=3)"
+        - |
+          import os
+          from urllib.request import urlopen
+          urlopen(f"http://127.0.0.1:{os.environ.get('PORT', '8080')}/api/health", timeout=3)
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 60s
 
 volumes:
   umb-syncer-data:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 import uuid
 
@@ -53,13 +54,37 @@ class Repository:
             )
         return self.get_integration(integration_id, user_id)
 
-    def update_group(self, integration_id: str, user_id: str, group_number: int) -> dict | None:
-        calendar_name = f"UMB Fizjoterapia — grupa 6 nr {group_number}"
+    @staticmethod
+    def default_calendar_name(group_number: int) -> str:
+        return "KiedyMam — wszystkie zajęcia" if group_number == 0 else f"KiedyMam — grupa {group_number}"
+
+    def update_group(
+        self,
+        integration_id: str,
+        user_id: str,
+        group_number: int | None = None,
+        calendar_name: str | None = None,
+    ) -> dict | None:
         with self.database.transaction(immediate=True) as db:
+            prior = db.execute(
+                "SELECT group_number,calendar_name,last_reconciled_sha256 FROM integrations WHERE id=? AND user_id=?",
+                (integration_id, user_id),
+            ).fetchone()
+            if not prior:
+                return None
+            prior_group = int(prior["group_number"])
+            new_group = int(group_number) if group_number is not None else prior_group
+            if calendar_name is not None:
+                new_name = calendar_name.strip()
+            elif group_number is not None and prior["calendar_name"] == self.default_calendar_name(prior_group):
+                new_name = self.default_calendar_name(new_group)
+            else:
+                new_name = prior["calendar_name"]
+            new_reconciled_hash = None if new_group != prior_group else prior["last_reconciled_sha256"]
             cursor = db.execute(
-                """UPDATE integrations SET group_number=?, calendar_name=?, last_reconciled_sha256=NULL,
+                """UPDATE integrations SET group_number=?,calendar_name=?,last_reconciled_sha256=?,
                    updated_at=? WHERE id=? AND user_id=?""",
-                (group_number, calendar_name, utc_now(), integration_id, user_id),
+                (new_group, new_name, new_reconciled_hash, utc_now(), integration_id, user_id),
             )
             if cursor.rowcount == 0:
                 return None
@@ -122,6 +147,14 @@ class Repository:
             )
         return changed
 
+    def touch_source_cache(self, source_url: str) -> bool:
+        with self.database.transaction(immediate=True) as db:
+            cursor = db.execute(
+                "UPDATE source_cache SET fetched_at=? WHERE source_url=?",
+                (utc_now(), source_url),
+            )
+        return cursor.rowcount > 0
+
     def delete_expired_source_cache(self, max_age_hours: int = 12) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat(timespec="seconds")
         with self.database.transaction(immediate=True) as db:
@@ -130,6 +163,48 @@ class Repository:
                 (cutoff,),
             )
         return cursor.rowcount
+
+    def timetable_links(self, query: str = "", limit: int = 1000) -> list[dict]:
+        sql = (
+            "SELECT url,href_label,programme,page_url,format_id,last_seen_at "
+            "FROM timetable_links WHERE active=1"
+        )
+        args: list = []
+        if query.strip():
+            sql += " AND (href_label LIKE ? OR programme LIKE ? OR url LIKE ?)"
+            term = f"%{query.strip()}%"
+            args.extend((term, term, term))
+        sql += " ORDER BY programme COLLATE NOCASE,href_label COLLATE NOCASE LIMIT ?"
+        args.append(max(1, min(limit, 2000)))
+        with self.database.read() as db:
+            rows = db.execute(sql, args).fetchall()
+        return [dict(row) for row in rows]
+
+    def replace_timetable_links(self, links: list[dict], complete: bool) -> None:
+        now = utc_now()
+        with self.database.transaction(immediate=True) as db:
+            if complete:
+                db.execute("UPDATE timetable_links SET active=0")
+            db.executemany(
+                """INSERT INTO timetable_links(
+                       url,href_label,programme,page_url,format_id,discovered_at,last_seen_at,active
+                   ) VALUES(?,?,?,?,?,?,?,1)
+                   ON CONFLICT(url) DO UPDATE SET href_label=excluded.href_label,
+                       programme=excluded.programme,page_url=excluded.page_url,
+                       format_id=excluded.format_id,last_seen_at=excluded.last_seen_at,active=1""",
+                [
+                    (
+                        link["url"],
+                        link["href_label"],
+                        link["programme"],
+                        link["page_url"],
+                        link["format_id"],
+                        now,
+                        now,
+                    )
+                    for link in links
+                ],
+            )
 
     def get_calendar_events(self, integration_id: str) -> dict[str, dict]:
         with self.database.read() as db:
@@ -140,9 +215,11 @@ class Repository:
         }
 
     def replace_calendar_events(
-        self, integration: dict, desired: dict[str, dict], changes: list[tuple[str, dict]]
-    ) -> None:
+        self, integration: dict, desired: dict[str, dict], changes: list[tuple[str, dict]],
+        *, emit_notifications: bool = True, sync_trigger: str = "scheduled",
+    ) -> list[dict]:
         now = utc_now()
+        created: list[dict] = []
         with self.database.transaction(immediate=True) as db:
             db.execute("DELETE FROM calendar_events WHERE integration_id=?", (integration["id"],))
             db.executemany(
@@ -153,19 +230,140 @@ class Repository:
                     for event_key, record in desired.items()
                 ],
             )
-            for action, event in changes:
+            for action, event in (changes if emit_notifications else []):
                 schedule = event.get("schedule", event)
                 event_start = f"{schedule.get('date', '')}T{schedule.get('start', '')}"
                 summary = schedule.get("summary") or schedule.get("source_text") or "Zajęcia"
                 date_text = event_start.replace("T", " ")
                 action_text = {"added": "Dodano", "updated": "Zmieniono", "removed": "Usunięto"}[action]
-                message = f"{action_text}: {summary} — {date_text}"
+                trigger_text = {
+                    "scheduled": "Automatyczna kontrola",
+                    "manual": "Synchronizacja ręczna",
+                    "source_changed": "Zmiana planu źródłowego",
+                }.get(sync_trigger, sync_trigger)
+                message = f"{trigger_text}: {action_text}: {summary} — {date_text}"
+                item = {
+                    "id": str(uuid.uuid4()), "user_id": integration["user_id"],
+                    "integration_id": integration["id"], "action": action,
+                    "event_summary": summary, "event_start": event_start,
+                    "message": message, "sync_trigger": sync_trigger,
+                    "created_at": now, "read_at": None,
+                }
                 db.execute(
-                    """INSERT INTO notifications(id,user_id,integration_id,action,event_summary,event_start,message,created_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (str(uuid.uuid4()), integration["user_id"], integration["id"], action, summary, event_start, message, now),
+                    """INSERT INTO notifications(id,user_id,integration_id,action,event_summary,event_start,message,sync_trigger,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (item["id"], item["user_id"], item["integration_id"], action, summary,
+                     event_start, message, sync_trigger, now),
                 )
+                created.append(item)
             db.execute("UPDATE integrations SET last_sync_at=?, updated_at=? WHERE id=?", (now, now, integration["id"]))
+        return created
+
+    def create_sync_completion_notification(self, integration: dict, trigger: str) -> dict:
+        labels = {
+            "integration_created": "Integracja została utworzona",
+            "integration_changed": "Ustawienia integracji zostały zmienione",
+            "manual": "Ręczna synchronizacja została zakończona",
+            "scheduled": "Automatyczna synchronizacja została zakończona",
+            "source_changed": "Zakończono synchronizację po zmianie planu UMB",
+        }
+        item = {
+            "id": str(uuid.uuid4()), "user_id": integration["user_id"],
+            "integration_id": integration["id"], "action": "sync_completed",
+            "event_summary": integration["calendar_name"], "event_start": "",
+            "message": labels.get(trigger, "Synchronizacja została zakończona"),
+            "sync_trigger": trigger, "created_at": utc_now(), "read_at": None,
+        }
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO notifications(id,user_id,integration_id,action,event_summary,event_start,message,sync_trigger,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item["id"], item["user_id"], item["integration_id"], item["action"],
+                 item["event_summary"], item["event_start"], item["message"], trigger, item["created_at"]),
+            )
+        return item
+
+    def create_sync_failure_notification(self, integration: dict, trigger: str) -> dict:
+        labels = {
+            "integration_created": "Nie udało się utworzyć kalendarza z tym planem.",
+            "integration_changed": "Nie udało się zastosować zmienionych ustawień integracji.",
+            "manual": "Nie udało się zakończyć ręcznej synchronizacji planu.",
+        }
+        item = {
+            "id": str(uuid.uuid4()), "user_id": integration["user_id"],
+            "integration_id": integration["id"], "action": "sync_failed",
+            "event_summary": integration["calendar_name"], "event_start": "",
+            "message": labels.get(trigger, "Synchronizacja planu nie powiodła się."),
+            "sync_trigger": trigger, "created_at": utc_now(), "read_at": None,
+        }
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO notifications(id,user_id,integration_id,action,event_summary,event_start,message,sync_trigger,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item["id"], item["user_id"], item["integration_id"], item["action"],
+                 item["event_summary"], item["event_start"], item["message"], trigger, item["created_at"]),
+            )
+        return item
+
+    def create_integration_deletion_notification(self, integration: dict, calendar_deleted: bool) -> dict:
+        message = (
+            f"Integracja „{integration['calendar_name']}” i jej kalendarz zostały usunięte."
+            if calendar_deleted else
+            f"Integracja „{integration['calendar_name']}” została usunięta, ale kalendarz Google pozostał na koncie."
+        )
+        item = {
+            "id": str(uuid.uuid4()), "user_id": integration["user_id"],
+            "integration_id": None, "action": "integration_deleted",
+            "event_summary": integration["calendar_name"], "event_start": "",
+            "message": message, "sync_trigger": "integration_deleted",
+            "created_at": utc_now(), "read_at": None,
+        }
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO notifications(id,user_id,integration_id,action,event_summary,event_start,message,sync_trigger,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item["id"], item["user_id"], None, item["action"], item["event_summary"],
+                 "", message, item["sync_trigger"], item["created_at"]),
+            )
+        return item
+
+    def save_push_subscription(self, user_id: str, subscription: dict, user_agent: str, crypto) -> str:
+        endpoint = subscription["endpoint"]
+        endpoint_hash = sha256(endpoint.encode("utf-8")).hexdigest()
+        nonce, ciphertext = crypto.encrypt_payload(user_id, f"push:{endpoint_hash}", subscription)
+        subscription_id = str(uuid.uuid4())
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO push_subscriptions(id,user_id,endpoint_hash,nonce,ciphertext,user_agent,created_at)
+                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(endpoint_hash) DO UPDATE SET
+                   user_id=excluded.user_id,nonce=excluded.nonce,ciphertext=excluded.ciphertext,
+                   user_agent=excluded.user_agent,created_at=excluded.created_at""",
+                (subscription_id, user_id, endpoint_hash, nonce, ciphertext, user_agent[:300], utc_now()),
+            )
+            row = db.execute("SELECT id FROM push_subscriptions WHERE endpoint_hash=?", (endpoint_hash,)).fetchone()
+        return row["id"]
+
+    def push_subscriptions(self, user_id: str, crypto) -> list[dict]:
+        with self.database.read() as db:
+            rows = db.execute(
+                "SELECT * FROM push_subscriptions WHERE user_id=? ORDER BY created_at DESC", (user_id,)
+            ).fetchall()
+        return [{
+            "id": row["id"], "user_id": user_id, "created_at": row["created_at"],
+            "user_agent": row["user_agent"],
+            "subscription": crypto.decrypt_payload(
+                user_id, f"push:{row['endpoint_hash']}", bytes(row["nonce"]), bytes(row["ciphertext"])
+            ),
+        } for row in rows]
+
+    def delete_push_subscription(self, subscription_id: str, user_id: str) -> bool:
+        with self.database.transaction(immediate=True) as db:
+            cursor = db.execute("DELETE FROM push_subscriptions WHERE id=? AND user_id=?", (subscription_id, user_id))
+        return cursor.rowcount > 0
+
+    def delete_push_subscription_by_hash(self, endpoint_hash: str) -> None:
+        with self.database.transaction(immediate=True) as db:
+            db.execute("DELETE FROM push_subscriptions WHERE endpoint_hash=?", (endpoint_hash,))
 
     def notifications(
         self, user_id: str, unread_only: bool = False, limit: int = 100, offset: int = 0

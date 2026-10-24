@@ -60,6 +60,22 @@ class ConfigurationTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     load_settings()
 
+    def test_push_configuration_exposes_only_the_oci_secret_reference(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_OAUTH_CLIENT_JSON": CLIENT,
+                "OCI_WEB_PUSH_VAPID_SECRET_OCID": "ocid1.vaultsecret.example",
+                "WEB_PUSH_VAPID_PUBLIC_KEY": "must-not-be-used",
+                "WEB_PUSH_VAPID_PRIVATE_KEY": "must-not-be-used",
+            },
+            clear=False,
+        ):
+            settings = load_settings()
+        self.assertEqual(settings.web_push_secret_ocid, "ocid1.vaultsecret.example")
+        self.assertFalse(hasattr(settings, "web_push_public_key"))
+        self.assertFalse(hasattr(settings, "web_push_private_key"))
+
 
 if __name__ == "__main__":
     unittest.main()

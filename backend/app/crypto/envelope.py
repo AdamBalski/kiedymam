@@ -18,13 +18,13 @@ class EnvelopeCrypto:
         self.master_key = master_key
 
     @staticmethod
-    def load_master_key(secret_ocid: str) -> bytes:
+    def load_secret_value(secret_ocid: str) -> bytes:
         if not secret_ocid:
-            raise RuntimeError("OCI_SECRET_OCID is required")
+            raise RuntimeError("OCI secret OCID is required")
         try:
             import oci
         except ImportError as exc:
-            raise RuntimeError("OCI SDK is required to retrieve OCI_SECRET_OCID") from exc
+            raise RuntimeError("OCI SDK is required to retrieve OCI secrets") from exc
 
         config_file = os.environ.get("OCI_CONFIG_FILE")
         if config_file:
@@ -35,7 +35,11 @@ class EnvelopeCrypto:
             client = oci.secrets.SecretsClient(config={}, signer=signer)
         response = client.get_secret_bundle(secret_id=secret_ocid)
         content = response.data.secret_bundle_content.content
-        stored_content = base64.b64decode(content, validate=True)
+        return base64.b64decode(content, validate=True)
+
+    @staticmethod
+    def load_master_key(secret_ocid: str) -> bytes:
+        stored_content = EnvelopeCrypto.load_secret_value(secret_ocid)
         if len(stored_content) == 32:
             key = stored_content
         else:
@@ -90,3 +94,28 @@ class EnvelopeCrypto:
             bytes(data_row["nonce"]), bytes(data_row["ciphertext"]), user_id.encode("utf-8")
         )
         return json.loads(plaintext)
+
+    def encrypt_payload(self, user_id: str, context: str, value: dict) -> tuple[bytes, bytes]:
+        """Encrypt per-user auxiliary data with the existing wrapped leaf key."""
+        with self.database.read() as db:
+            row = db.execute("SELECT nonce, wrapped_key FROM leaf_keys WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            raise RuntimeError("User encryption key is not initialized")
+        leaf_key = AESGCM(self.master_key).decrypt(
+            bytes(row["nonce"]), bytes(row["wrapped_key"]), user_id.encode("utf-8")
+        )
+        nonce = os.urandom(12)
+        aad = f"{user_id}:{context}".encode("utf-8")
+        plaintext = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return nonce, AESGCM(leaf_key).encrypt(nonce, plaintext, aad)
+
+    def decrypt_payload(self, user_id: str, context: str, nonce: bytes, ciphertext: bytes) -> dict:
+        with self.database.read() as db:
+            row = db.execute("SELECT nonce, wrapped_key FROM leaf_keys WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            raise RuntimeError("User encryption key is not initialized")
+        leaf_key = AESGCM(self.master_key).decrypt(
+            bytes(row["nonce"]), bytes(row["wrapped_key"]), user_id.encode("utf-8")
+        )
+        aad = f"{user_id}:{context}".encode("utf-8")
+        return json.loads(AESGCM(leaf_key).decrypt(nonce, ciphertext, aad))

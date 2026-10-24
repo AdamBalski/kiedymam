@@ -26,7 +26,7 @@ p { margin: .5em 0; }
 a { color: #06c; text-decoration: underline; }
 a:hover { color: #003d7a; }
 
-button, input {
+button, input, select {
   display: inline-block;
   margin: .25em .25em .25em 0;
   padding: .5em 1em;
@@ -40,22 +40,15 @@ button { cursor: pointer; font-weight: 600; }
 button:hover, .button:hover { color: #fff; background: #222; }
 button:disabled { cursor: not-allowed; opacity: .5; }
 button:disabled:hover { color: #222; background: #fff; }
-input { display: block; width: 100%; max-width: 560px; margin: .5em 0 1em; }
+input, select { display: block; width: 100%; max-width: 560px; margin: .5em 0 1em; }
 input:focus { outline: 3px solid #06c; }
 label { display: block; font-weight: 600; }
+.checkbox-option { display: flex; align-items: center; gap: .5em; margin: .8em 0 1em; }
+input[type="checkbox"] { display: inline-block; width: 1.2em; height: 1.2em; margin: 0; }
 
 .site-header { border-bottom: 2px solid #222; padding-bottom: 1em; }
 .site-header h1 { display: flex; align-items: center; gap: .55em; }
-.brand-mark {
-  display: inline-grid;
-  width: 58px;
-  height: 58px;
-  place-items: center;
-  border: 2px solid #222;
-  color: #222;
-  font-size: .62em;
-  line-height: 1;
-}
+.brand-logo { display: block; width: min(220px, 75vw); height: auto; max-height: 160px; object-fit: contain; object-position: left center; }
 .muted { color: #555; font-size: .92em; }
 .nav {
   display: flex;

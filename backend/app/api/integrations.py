@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.auth import current_user, require_csrf
@@ -17,11 +17,13 @@ router = APIRouter(prefix="/api/integrations", tags=["integrations"])
 
 class IntegrationRequest(BaseModel):
     source_url: str = Field(min_length=8, max_length=2048)
-    group_number: int = Field(ge=1, le=36)
+    group_number: int = Field(ge=0, le=999)
+    calendar_name: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class GroupUpdate(BaseModel):
-    group_number: int = Field(ge=1, le=36)
+    group_number: int | None = Field(default=None, ge=0, le=999)
+    calendar_name: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 def _services(request: Request) -> tuple[Repository, CalendarService]:
@@ -41,6 +43,14 @@ def _public(integration: dict) -> dict:
     }
 
 
+def _record_sync_failure(repository: Repository, calendar_service: CalendarService, integration: dict, trigger: str) -> None:
+    try:
+        notice = repository.create_sync_failure_notification(integration, trigger)
+        calendar_service.publish_notifications([notice])
+    except Exception:
+        LOG.exception("Could not save or send sync failure notification integration=%s", integration.get("id"))
+
+
 async def _delete_unclaimed_calendar(
     user_id: str, calendar_id: str, request: Request, repository: Repository
 ) -> None:
@@ -58,9 +68,50 @@ async def list_integrations(request: Request, user: dict = Depends(current_user)
     return [_public(row) for row in repository.list_integrations(user["id"])]
 
 
+def _validate_group_choice(parsed: dict, group_number: int) -> None:
+    mode = parsed.get("grouping_mode", "unknown")
+    available = parsed.get("available_groups", [])
+    if mode == "all" and group_number != 0:
+        raise HTTPException(status_code=422, detail="This plan has no group split; choose all activities.")
+    if mode == "groups" and group_number not in available:
+        choices = ", ".join(map(str, available))
+        raise HTTPException(
+            status_code=422,
+            detail=f"Group {group_number} is not present in this workbook. Available groups: {choices}.",
+        )
+    if mode == "unknown" and group_number == 0:
+        raise HTTPException(status_code=422, detail="This workbook does not identify groups. Enter your group number.")
+
+
+@router.get("/workbook-info")
+async def workbook_info(
+    request: Request,
+    source_url: str = Query(min_length=8, max_length=2048),
+    user: dict = Depends(current_user),
+) -> dict:
+    del user
+    _, calendar_service = _services(request)
+    try:
+        canonical_url = canonicalize_xlsx_url(source_url)
+        parsed = await calendar_service.get_source(canonical_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        LOG.exception("Could not inspect UMB schedule workbook")
+        raise HTTPException(status_code=502, detail="Could not read this UMB schedule workbook") from exc
+    return {
+        "source_url": canonical_url,
+        "format_id": parsed.get("format_id"),
+        "grouping_mode": parsed.get("grouping_mode", "unknown"),
+        "available_groups": parsed.get("available_groups", []),
+    }
+
+
 @router.post("", dependencies=[Depends(require_csrf)])
 async def create_integration(payload: IntegrationRequest, request: Request, user: dict = Depends(current_user)) -> dict:
     repository, calendar_service = _services(request)
+    if payload.calendar_name is not None and not payload.calendar_name.strip():
+        raise HTTPException(status_code=422, detail="Calendar name cannot be empty")
     if repository.list_integrations(user["id"]):
         raise HTTPException(status_code=409, detail="This Google account already has an integration. Delete it before setting up another.")
     try:
@@ -72,7 +123,8 @@ async def create_integration(payload: IntegrationRequest, request: Request, user
         LOG.exception("Could not load UMB schedule during integration setup")
         raise HTTPException(status_code=502, detail="Could not read this UMB schedule workbook") from exc
 
-    calendar_name = f"UMB Fizjoterapia — grupa 6 nr {payload.group_number}"
+    _validate_group_choice(parsed, payload.group_number)
+    calendar_name = (payload.calendar_name or repository.default_calendar_name(payload.group_number)).strip()
     try:
         calendar_id = await asyncio.to_thread(
             gcal.create_calendar, user["id"], repository, request.app.state.crypto, calendar_name
@@ -95,12 +147,18 @@ async def create_integration(payload: IntegrationRequest, request: Request, user
         raise HTTPException(status_code=500, detail="Could not save this integration") from exc
 
     try:
-        await asyncio.to_thread(calendar_service.reconcile, integration, parsed)
+        await asyncio.to_thread(
+            calendar_service.reconcile, integration, parsed,
+            emit_notifications=False, sync_trigger="integration_created",
+        )
         cache = repository.get_source_cache(source_url)
         if cache:
             repository.mark_reconciled(integration["id"], cache["content_sha256"])
+        notice = repository.create_sync_completion_notification(integration, "integration_created")
+        calendar_service.publish_notifications([notice])
     except Exception as exc:
         LOG.exception("Initial calendar reconciliation failed")
+        _record_sync_failure(repository, calendar_service, integration, "integration_created")
         repository.delete_integration(integration["id"], user["id"])
         await _delete_unclaimed_calendar(user["id"], calendar_id, request, repository)
         raise HTTPException(status_code=502, detail="The calendar was created, but the initial schedule sync failed") from exc
@@ -113,16 +171,51 @@ async def update_integration(integration_id: str, payload: GroupUpdate, request:
     existing = repository.get_integration(integration_id, user["id"])
     if not existing:
         raise HTTPException(status_code=404, detail="Integration not found")
-    integration = repository.update_group(integration_id, user["id"], payload.group_number)
+    if payload.group_number is None and payload.calendar_name is None:
+        raise HTTPException(status_code=422, detail="Provide a group number or calendar name")
+    if payload.calendar_name is not None and not payload.calendar_name.strip():
+        raise HTTPException(status_code=422, detail="Calendar name cannot be empty")
+    if payload.group_number is None:
+        calendar_name = payload.calendar_name.strip()
+        try:
+            await asyncio.to_thread(calendar_service.rename_calendar, existing, calendar_name)
+        except Exception as exc:
+            LOG.exception("Could not rename the app-managed Google Calendar")
+            _record_sync_failure(repository, calendar_service, existing, "integration_changed")
+            raise HTTPException(status_code=502, detail="Could not rename the dedicated Google Calendar") from exc
+        integration = repository.update_group(integration_id, user["id"], calendar_name=calendar_name)
+        notice = repository.create_sync_completion_notification(integration, "integration_changed")
+        calendar_service.publish_notifications([notice])
+        return _public(integration)
     try:
-        parsed = await calendar_service.get_source(integration["source_url"])
-        integration = repository.get_integration(integration_id, user["id"])
-        await asyncio.to_thread(calendar_service.reconcile, integration, parsed)
+        parsed = await calendar_service.get_source(
+            existing["source_url"], suppress_integration_id=integration_id
+        )
+    except Exception as exc:
+        LOG.exception("Could not load schedule while updating integration")
+        _record_sync_failure(repository, calendar_service, existing, "integration_changed")
+        raise HTTPException(status_code=502, detail="Could not read this UMB schedule workbook") from exc
+    if payload.group_number is not None:
+        _validate_group_choice(parsed, payload.group_number)
+    integration = repository.update_group(
+        integration_id,
+        user["id"],
+        payload.group_number,
+        payload.calendar_name,
+    )
+    try:
+        await asyncio.to_thread(
+            calendar_service.reconcile, integration, parsed,
+            emit_notifications=False, sync_trigger="integration_changed",
+        )
         cache = repository.get_source_cache(integration["source_url"])
         if cache:
             repository.mark_reconciled(integration_id, cache["content_sha256"])
+        notice = repository.create_sync_completion_notification(integration, "integration_changed")
+        calendar_service.publish_notifications([notice])
     except Exception as exc:
         LOG.exception("Could not reconcile after group change")
+        _record_sync_failure(repository, calendar_service, integration, "integration_changed")
         raise HTTPException(status_code=502, detail="Group was saved, but the calendar could not be reconciled") from exc
     return _public(repository.get_integration(integration_id, user["id"]))
 
@@ -140,9 +233,16 @@ async def sync_now(integration_id: str, request: Request, user: dict = Depends(c
         return {"status": "skipped", "retry_at": eligible_at}
     try:
         result = await calendar_service.sync_integration(integration, force_remote_read=True)
+        current = repository.get_integration(integration_id, user["id"])
+        if current:
+            notice = repository.create_sync_completion_notification(current, "manual")
+            calendar_service.publish_notifications([notice])
         return {"status": "synced", **result}
     except Exception as exc:
         LOG.exception("Manual sync failed integration=%s", integration_id)
+        current = repository.get_integration(integration_id, user["id"])
+        if current:
+            _record_sync_failure(repository, calendar_service, current, "manual")
         raise HTTPException(status_code=502, detail="Could not sync this schedule right now") from exc
 
 
@@ -157,4 +257,6 @@ async def delete_integration(integration_id: str, request: Request, user: dict =
     except Exception as exc:
         LOG.exception("Could not delete app-managed Google Calendar")
         raise HTTPException(status_code=502, detail="Could not delete the dedicated Google Calendar") from exc
+    notice = repository.create_integration_deletion_notification(integration, calendar_deleted)
+    calendar_service.publish_notifications([notice])
     return {"deleted": True, "calendar_deleted": calendar_deleted}

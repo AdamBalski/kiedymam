@@ -5,6 +5,7 @@ import unittest
 
 from app.db.database import Database
 from app.db.repository import Repository
+from app.crypto.envelope import EnvelopeCrypto
 
 
 class RepositoryTests(unittest.TestCase):
@@ -23,7 +24,7 @@ class RepositoryTests(unittest.TestCase):
             source_url="https://www.umb.edu.pl/schedule.xlsx",
             group_number=1,
             calendar_id="calendar-1",
-            calendar_name="UMB Fizjoterapia — grupa 6 nr 1",
+            calendar_name="KiedyMam — grupa 1",
         )
 
     def tearDown(self):
@@ -57,8 +58,36 @@ class RepositoryTests(unittest.TestCase):
         updated = self.repository.update_group(self.integration["id"], "user-1", 3)
 
         self.assertEqual(updated["group_number"], 3)
-        self.assertEqual(updated["calendar_name"], "UMB Fizjoterapia — grupa 6 nr 3")
+        self.assertEqual(updated["calendar_name"], "KiedyMam — grupa 3")
         self.assertIsNone(updated["last_reconciled_sha256"])
+
+    def test_calendar_name_can_be_changed_without_changing_the_group(self):
+        updated = self.repository.update_group(
+            self.integration["id"], "user-1", calendar_name="Plan"
+        )
+        self.assertEqual(updated["group_number"], 1)
+        self.assertEqual(updated["calendar_name"], "Plan")
+
+    def test_all_groups_calendar_name_has_a_default(self):
+        self.assertEqual(
+            self.repository.default_calendar_name(0), "KiedyMam — wszystkie zajęcia"
+        )
+
+    def test_sync_completion_notification_keeps_its_trigger_for_the_ui(self):
+        self.repository.create_sync_completion_notification(self.integration, "manual")
+        notification = self.repository.notifications("user-1")[0]
+        self.assertEqual(notification["sync_trigger"], "manual")
+        self.assertEqual(notification["action"], "sync_completed")
+
+    def test_failed_integration_change_creates_a_failure_notice_not_an_event_diff(self):
+        notice = self.repository.create_sync_failure_notification(
+            self.integration, "integration_changed"
+        )
+        stored = self.repository.notifications("user-1")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["id"], notice["id"])
+        self.assertEqual(stored[0]["action"], "sync_failed")
+        self.assertEqual(stored[0]["sync_trigger"], "integration_changed")
 
     def test_cache_upsert_reports_hash_changes_and_expired_entries_are_removed(self):
         parsed = {"events": [], "changelog": []}
@@ -73,6 +102,22 @@ class RepositoryTests(unittest.TestCase):
             )
         self.assertEqual(self.repository.delete_expired_source_cache(12), 1)
         self.assertIsNone(self.repository.get_source_cache(self.integration["source_url"]))
+
+    def test_successful_unchanged_download_can_extend_cache_age_without_replacing_parsed_data(self):
+        parsed = {"events": [], "changelog": [], "_parser_version": 1}
+        source_url = self.integration["source_url"]
+        self.repository.upsert_source_cache(source_url, "same-hash", parsed)
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                "UPDATE source_cache SET fetched_at='2020-01-01T00:00:00+00:00' WHERE source_url=?",
+                (source_url,),
+            )
+
+        self.assertTrue(self.repository.touch_source_cache(source_url))
+
+        cache = self.repository.get_source_cache(source_url)
+        self.assertEqual(cache["parsed"], parsed)
+        self.assertNotEqual(cache["fetched_at"], "2020-01-01T00:00:00+00:00")
 
     def test_reconciliation_persists_human_readable_notifications(self):
         event = {
@@ -93,6 +138,47 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(len(notifications), 1)
         self.assertIn("Dodano: Anatomia", notifications[0]["message"])
         self.assertIn("2026-10-26 08:00", notifications[0]["message"])
+        self.assertEqual(notifications[0]["sync_trigger"], "scheduled")
+
+    def test_integration_changes_can_suppress_event_notifications(self):
+        event = {"date": "2026-10-26", "start": "08:00", "summary": "Anatomia"}
+        self.repository.replace_calendar_events(
+            self.integration, {}, [("added", event)], emit_notifications=False,
+            sync_trigger="integration_changed",
+        )
+        self.assertEqual(self.repository.notifications("user-1"), [])
+
+    def test_custom_calendar_name_is_mutable_and_preserved_when_group_changes(self):
+        updated = self.repository.update_group(
+            self.integration["id"], "user-1", 3, "Mój plan"
+        )
+        self.assertEqual(updated["group_number"], 3)
+        self.assertEqual(updated["calendar_name"], "Mój plan")
+
+    def test_deletion_notice_survives_removal_of_its_integration(self):
+        self.repository.delete_integration(self.integration["id"], "user-1")
+        notice = self.repository.create_integration_deletion_notification(self.integration, True)
+        stored = self.repository.notifications("user-1")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["id"], notice["id"])
+        self.assertIsNone(stored[0]["integration_id"])
+        self.assertEqual(stored[0]["sync_trigger"], "integration_deleted")
+
+    def test_push_subscriptions_are_encrypted_and_removable_per_device(self):
+        crypto = EnvelopeCrypto(self.database, b"m" * 32)
+        crypto.encrypt_for_user("user-1", {"access_token": "test"})
+        subscription = {
+            "endpoint": "https://fcm.googleapis.com/fcm/send/token",
+            "keys": {"p256dh": "p256dh-secret", "auth": "auth-secret"},
+        }
+        subscription_id = self.repository.save_push_subscription(
+            "user-1", subscription, "Browser", crypto
+        )
+        records = self.repository.push_subscriptions("user-1", crypto)
+        self.assertEqual(records[0]["id"], subscription_id)
+        self.assertEqual(records[0]["subscription"], subscription)
+        self.assertTrue(self.repository.delete_push_subscription(subscription_id, "user-1"))
+        self.assertEqual(self.repository.push_subscriptions("user-1", crypto), [])
 
 
 if __name__ == "__main__":
