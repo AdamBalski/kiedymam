@@ -53,6 +53,10 @@ def execute_query(store, query: QuerySpec) -> dict[str, Any]:
     if not query.operations or not isinstance(query.operations[0], MetricOperation):
         raise ValueError("A query must start with a metric operation")
     first = query.operations[0]
+    available_dimensions = {dimension["name"] for dimension in store.dimensions(query.metric)}
+    discarded = set(first.group_by) - available_dimensions
+    if discarded:
+        raise ValueError(f"Unknown dimensions for metric {query.metric!r}: {', '.join(sorted(discarded))}")
     result = store.query(
         query.metric, query.start, query.end,
         filters=query.filters or {}, group_by=list(first.group_by),
@@ -60,6 +64,7 @@ def execute_query(store, query: QuerySpec) -> dict[str, Any]:
     )
     series = result["series"]
     step_seconds = result["step_seconds"]
+    available_dimensions = set(first.group_by)
     for operation in query.operations[1:]:
         if isinstance(operation, Predicate):
             series = _apply_predicate(series, operation)
@@ -71,9 +76,16 @@ def execute_query(store, query: QuerySpec) -> dict[str, Any]:
                 raise ValueError("Arithmetic queries must use the same interval resolution")
             series = _apply_arithmetic(series, other["series"], operation.operator)
         else:
+            discarded = set(operation.group_by) - available_dimensions
+            if discarded:
+                raise ValueError(
+                    "Metric operation cannot group by dimensions no longer present in its input: "
+                    + ", ".join(sorted(discarded))
+                )
             series, step_seconds = _apply_metric_operation(
                 series, operation, step_seconds, query.start, query.end,
             )
+            available_dimensions = set(operation.group_by)
     return {"series": series, "step_seconds": step_seconds}
 
 

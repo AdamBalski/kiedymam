@@ -10,21 +10,61 @@ function MetricChart({ series }) {
   const points = series.flatMap((item) => item.points);
   if (!points.length) return <p className="muted">Brak próbek w wybranym przedziale.</p>;
   const width = 900;
-  const height = 260;
-  const pad = 32;
+  const height = 300;
+  const left = 88;
+  const right = 18;
+  const top = 20;
+  const bottom = 48;
   const minTime = Math.min(...points.map((point) => point.timestamp));
   const maxTime = Math.max(...points.map((point) => point.timestamp), minTime + 1);
   const values = points.map((point) => Number(point.value));
-  const minValue = Math.min(0, ...values);
-  const maxValue = Math.max(...values, minValue + 1);
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const flatRange = Math.max(Math.abs(maxValue) * 0.1, 0.000001);
+  const domainMin = minValue === maxValue ? maxValue - flatRange : minValue;
+  const domainMax = maxValue;
   const colors = ["#005a9c", "#c3423f", "#237a57", "#7b4ba1", "#b66a00", "#007c91"];
-  const x = (time) => pad + ((time - minTime) / (maxTime - minTime)) * (width - pad * 2);
-  const y = (value) => height - pad - ((value - minValue) / (maxValue - minValue)) * (height - pad * 2);
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const x = (time) => left + ((time - minTime) / (maxTime - minTime)) * plotWidth;
+  const y = (value) => top + ((domainMax - value) / (domainMax - domainMin)) * plotHeight;
+  const formatValue = (value) => new Intl.NumberFormat(undefined, { maximumSignificantDigits: 4 }).format(value);
+  const rangeSeconds = maxTime - minTime;
+  const timeFormat = new Intl.DateTimeFormat(undefined, rangeSeconds > 86400
+    ? { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }
+    : { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const yTicks = Array.from({ length: 5 }, (_, index) => {
+    const fraction = index / 4;
+    const value = domainMax - fraction * (domainMax - domainMin);
+    return { value, y: top + fraction * plotHeight };
+  });
+  const xTicks = Array.from({ length: 5 }, (_, index) => {
+    const fraction = index / 4;
+    const timestamp = minTime + fraction * (maxTime - minTime);
+    return { timestamp, x: left + fraction * plotWidth };
+  });
   return (
     <div className="metric-chart-wrap">
-      <svg className="metric-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Wykres metryki">
-        <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke="#888" />
-        <line x1={pad} y1={pad} x2={pad} y2={height - pad} stroke="#888" />
+      <svg className="metric-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Wykres metryki z osiami i wartościami">
+        {yTicks.map((tick) => <g key={`y-${tick.value}`}>
+          <line x1={left} y1={tick.y} x2={width - right} y2={tick.y} stroke="#d7dce1" />
+          <text x={left - 10} y={tick.y} textAnchor="end" dominantBaseline="middle" className="metric-axis-label">
+            {formatValue(tick.value)}
+          </text>
+        </g>)}
+        <line x1={left} y1={top} x2={left} y2={height - bottom} stroke="#777" />
+        <line x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} stroke="#777" />
+        {xTicks.map((tick, index) => <g key={`x-${tick.timestamp}`}>
+          <line x1={tick.x} y1={height - bottom} x2={tick.x} y2={height - bottom + 5} stroke="#777" />
+          <text
+            x={tick.x}
+            y={height - bottom + 20}
+            textAnchor={index === 0 ? "start" : index === xTicks.length - 1 ? "end" : "middle"}
+            className="metric-axis-label"
+          >
+            {timeFormat.format(new Date(tick.timestamp * 1000))}
+          </text>
+        </g>)}
         {series.map((item, index) => (
           <g key={JSON.stringify(item.dimensions)}>
             <polyline
@@ -70,12 +110,28 @@ export default function MetricsPage({ setError, setSuccess }) {
 
   useEffect(() => {
     api.metricCatalog().then((data) => {
+      const firstMetric = data.metrics[0];
       setCatalog(data.metrics);
-      setSelectedName(data.metrics[0]?.name || "");
+      setSelectedName(firstMetric?.name || "");
+      setOperations([{ type: "metric", operation: "sum",
+        group_by: firstMetric?.dimensions.map((dimension) => dimension.name) || [], interval_seconds: null }]);
     }).catch((error) => setError(error.message));
   }, [setError]);
 
   const selected = useMemo(() => catalog.find((item) => item.name === selectedName), [catalog, selectedName]);
+
+  function groupableDimensions(operationIndex, sourceOperations = operations) {
+    const available = new Set((selected?.dimensions || []).map((dimension) => dimension.name));
+    for (const operation of sourceOperations.slice(0, operationIndex)) {
+      if (operation.type === "metric") {
+        const retained = new Set(operation.group_by);
+        for (const name of available) {
+          if (!retained.has(name)) available.delete(name);
+        }
+      }
+    }
+    return (selected?.dimensions || []).filter((dimension) => available.has(dimension.name));
+  }
 
   const minimumInterval = useMemo(() => {
     const range = (new Date(end).getTime() - new Date(start).getTime()) / 1000;
@@ -86,16 +142,28 @@ export default function MetricsPage({ setError, setSuccess }) {
     .filter((seconds) => seconds >= minimumInterval && seconds % minimumInterval === 0);
 
   function chooseMetric(name) {
+    const metric = catalog.find((item) => item.name === name);
     setSelectedName(name);
     setFilters({});
-    setOperations([{ type: "metric", operation: "sum", group_by: [], interval_seconds: null }]);
+    setOperations([{ type: "metric", operation: "sum",
+      group_by: metric?.dimensions.map((dimension) => dimension.name) || [], interval_seconds: null }]);
     setResult(null);
   }
 
   function updateOperation(index, updates) {
-    setOperations((current) => current.map((operation, itemIndex) => itemIndex === index
-      ? { ...operation, ...updates }
-      : operation));
+    setOperations((current) => {
+      const updated = current.map((operation, itemIndex) => itemIndex === index
+        ? { ...operation, ...updates }
+        : operation);
+      const available = new Set((selected?.dimensions || []).map((dimension) => dimension.name));
+      return updated.map((operation) => {
+        if (operation.type !== "metric") return operation;
+        const group_by = operation.group_by.filter((name) => available.has(name));
+        available.clear();
+        group_by.forEach((name) => available.add(name));
+        return group_by.length === operation.group_by.length ? operation : { ...operation, group_by };
+      });
+    });
   }
 
   function updateArithmeticFilter(index, name, value) {
@@ -109,9 +177,10 @@ export default function MetricsPage({ setError, setSuccess }) {
   }
 
   function addMetricOperation() {
+    const group_by = groupableDimensions(operations.length).map((dimension) => dimension.name);
     setOperations((current) => current.length >= 16 ? current : [
       ...current,
-      { type: "metric", operation: "sum", group_by: [], interval_seconds: null },
+      { type: "metric", operation: "sum", group_by, interval_seconds: null },
     ]);
   }
 
@@ -259,7 +328,7 @@ export default function MetricsPage({ setError, setSuccess }) {
               </select>
               <div className="metric-operation-groups">
                 <span>Grupuj według</span>
-                {(selected?.dimensions || []).map((dimension) => <label className="checkbox-option" key={dimension.name}>
+                {groupableDimensions(index).map((dimension) => <label className="checkbox-option" key={dimension.name}>
                   <input type="checkbox" checked={operation.group_by.includes(dimension.name)}
                     onChange={(event) => updateOperation(index, { group_by: event.target.checked
                       ? [...operation.group_by, dimension.name]
@@ -267,6 +336,11 @@ export default function MetricsPage({ setError, setSuccess }) {
                   {dimension.name}
                 </label>)}
               </div>
+              <p className="muted">
+                {operation.group_by.length === 0
+                  ? "Brak zaznaczonych wymiarów łączy wszystkie serie w jedną. Kolejne operacje nie będą miały wymiarów do grupowania."
+                  : "Wynik zachowa tylko zaznaczone wymiary; kolejne operacje będą mogły grupować tylko według nich."}
+              </p>
             </> : operation.type === "predicate" ? <>
               <label htmlFor={`predicate-operator-${index}`}>Warunek</label>
               <select id={`predicate-operator-${index}`} value={operation.operator}

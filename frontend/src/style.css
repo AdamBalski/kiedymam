@@ -112,6 +112,7 @@ li { margin: .35em 0; }
 .metric-time-range { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: .75em; }
 .metric-chart-wrap { overflow-x: auto; }
 .metric-chart { display: block; min-width: 520px; width: 100%; }
+.metric-axis-label { fill: #555; font-size: 12px; }
 .metric-legend { display: flex; flex-wrap: wrap; gap: .8em; font-size: .85em; }
 .metric-legend span { display: inline-flex; align-items: center; gap: .35em; }
 .metric-legend i { display: inline-block; width: .8em; height: .8em; }

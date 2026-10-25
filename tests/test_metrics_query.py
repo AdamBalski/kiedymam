@@ -75,6 +75,22 @@ class MetricsQueryTests(unittest.TestCase):
                 result = execute_query(self.store, query)
                 self.assertEqual(result["series"][0]["points"][0]["value"], 1.0)
 
+    def test_later_aggregation_cannot_group_by_a_discarded_dimension(self):
+        now = MetricsStore._bucket_start()
+        self.store.add_counter("test.requests", 2, {"outcome": "success", "xlsx.url": "/one.xlsx"})
+        self.store.add_counter("test.requests", 3, {"outcome": "success", "xlsx.url": "/two.xlsx"})
+        self.store.flush(now=now)
+
+        query = QuerySpec(
+            "test.requests", now - 60, now + 60, {}, (
+                MetricOperation("sum", group_by=("outcome",), interval_seconds=60),
+                MetricOperation("sum", group_by=("xlsx.url",), interval_seconds=60),
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "no longer present"):
+            execute_query(self.store, query)
+
 
 if __name__ == "__main__":
     unittest.main()

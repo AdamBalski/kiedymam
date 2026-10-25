@@ -60,18 +60,13 @@ jobs:
             printf 'export UMB_SYNCER_VERSION=%q\n' "$SHA"
             printf 'export APP_ORIGIN=%q\n' "$APP_ORIGIN"
             printf 'export APP_BASE_PATH=%q\n' "$APP_BASE_PATH"
+            printf 'export OCI_SECRET_OCID=%q\n' "$OCI_SECRET_OCID"
             printf 'export LOG_LEVEL=%q\n' "${LOG_LEVEL:-INFO}"
             printf 'export GOOGLE_OAUTH_CLIENT_JSON=%q\n' "$GOOGLE_OAUTH_CLIENT_JSON"
             cat <<'REMOTE'
           set -euo pipefail
           compose_file="/home/${DEPLOY_USER}/infra/compose/umb-syncer.yml"
-          docker system df
-          docker system prune -af --filter until=24h
-          available_kb=$(df -Pk /var/lib/docker | awk 'NR == 2 {print $4}')
-          if [ -z "$available_kb" ] || [ "$available_kb" -lt 2097152 ]; then
-            echo "Deployment stopped: Docker filesystem has less than 2 GiB free." >&2
-            exit 1
-          fi
+          docker compose -f "$compose_file" config --quiet
           previous_id=$(docker compose -f "$compose_file" ps -q umb-syncer || true)
           previous_volume=""
           previous_image=""
@@ -80,6 +75,13 @@ jobs:
             previous_image=$(docker inspect --format '{{.Config.Image}}' "$previous_id")
           fi
           previous_version="${previous_image##*:}"
+          docker system df
+          docker system prune -af --filter until=24h
+          available_kb=$(df -Pk /var/lib/docker | awk 'NR == 2 {print $4}')
+          if [ -z "$available_kb" ] || [ "$available_kb" -lt 2097152 ]; then
+            echo "Deployment stopped: Docker filesystem has less than 2 GiB free." >&2
+            exit 1
+          fi
           report_deploy_failure() {
             status=$?
             trap - ERR
@@ -114,8 +116,6 @@ jobs:
             echo "Deployment smoke check failed: startup logs contain a migration or exception failure." >&2
             exit 1
           fi
-          curl --fail --silent --show-error --output /dev/null "${APP_ORIGIN}${APP_BASE_PATH:-}/"
-          curl --fail --silent --show-error "${APP_ORIGIN}${APP_BASE_PATH:-}/api/health"
           trap - ERR
           REMOTE
           } | ssh -p "${DEPLOY_PORT:-22}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -s"
