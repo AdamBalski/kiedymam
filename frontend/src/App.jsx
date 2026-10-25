@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "./api.js";
 import ChangelogPage from "./components/changelog/ChangelogPage.jsx";
+import MetricsPage from "./components/admin/MetricsPage.jsx";
 import ContactPage from "./components/feedback/ContactPage.jsx";
 import LoginPage from "./components/auth/LoginPage.jsx";
 import MainNavigation from "./components/layout/MainNavigation.jsx";
@@ -35,6 +36,7 @@ export default function App() {
       try {
         const account = await api.me();
         setUser(account);
+        if (!account.is_admin && tab === "metrics") setTab("plan");
         const integrations = await api.integrations();
         setIntegration(integrations[0] || null);
       } catch (loadError) {
@@ -79,6 +81,7 @@ export default function App() {
             tab={tab}
             setTab={selectTab}
             email={user.email}
+            isAdmin={user.is_admin}
             onLogout={logout}
             clearMessages={() => { setError(""); setSuccess(""); }}
           />
@@ -92,7 +95,7 @@ export default function App() {
                   onCreated={(created) => {
                     setIntegration(created);
                     setShowSetup(false);
-                    setSuccess("Utworzono kalendarz z Twoim planem.");
+                    setSuccess("Utworzono osobny kalendarz. Pierwsza synchronizacja jest w kolejce.");
                   }}
                   setError={setError}
                 />
@@ -107,6 +110,7 @@ export default function App() {
           )}
           {tab === "notifications" && <NotificationsPage setError={setError} setSuccess={setSuccess} />}
           {tab === "changelog" && <ChangelogPage />}
+          {tab === "metrics" && user.is_admin && <MetricsPage setError={setError} setSuccess={setSuccess} />}
           {tab === "contact" && <ContactPage setError={setError} />}
         </>
       ) : tab === "contact" ? (

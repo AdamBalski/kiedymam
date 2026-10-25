@@ -1,8 +1,10 @@
 import asyncio
 import logging
+from math import ceil
+import time
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from app.api.auth import current_user, require_csrf
@@ -10,6 +12,7 @@ from app.calendar import gcal
 from app.calendar.source import canonicalize_xlsx_url
 from app.calendar.service import CalendarService
 from app.db.repository import Repository
+from app.jobs.queue import QueueFullError
 
 LOG = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
@@ -56,7 +59,8 @@ async def _delete_unclaimed_calendar(
 ) -> None:
     try:
         await asyncio.to_thread(
-            gcal.delete_calendar, user_id, calendar_id, repository, request.app.state.crypto
+            gcal.delete_calendar, user_id, calendar_id, repository, request.app.state.crypto,
+            request.app.state.metrics,
         )
     except Exception:
         LOG.exception("Could not remove unclaimed Google Calendar %s", calendar_id)
@@ -89,10 +93,20 @@ async def workbook_info(
     source_url: str = Query(min_length=8, max_length=2048),
     user: dict = Depends(current_user),
 ) -> dict:
-    del user
-    _, calendar_service = _services(request)
+    repository, calendar_service = _services(request)
     try:
         canonical_url = canonicalize_xlsx_url(source_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    accepted, retry_at = repository.reserve_workbook_inspection(user["id"], canonical_url)
+    if not accepted:
+        retry_seconds = max(1, ceil((retry_at or 0) - time.time()))
+        raise HTTPException(
+            status_code=429,
+            detail="You have reached the workbook inspection limit. Try again later.",
+            headers={"Retry-After": str(retry_seconds)},
+        )
+    try:
         parsed = await calendar_service.get_source(canonical_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -107,7 +121,7 @@ async def workbook_info(
     }
 
 
-@router.post("", dependencies=[Depends(require_csrf)])
+@router.post("", status_code=201, dependencies=[Depends(require_csrf)])
 async def create_integration(payload: IntegrationRequest, request: Request, user: dict = Depends(current_user)) -> dict:
     repository, calendar_service = _services(request)
     if payload.calendar_name is not None and not payload.calendar_name.strip():
@@ -127,7 +141,8 @@ async def create_integration(payload: IntegrationRequest, request: Request, user
     calendar_name = (payload.calendar_name or repository.default_calendar_name(payload.group_number)).strip()
     try:
         calendar_id = await asyncio.to_thread(
-            gcal.create_calendar, user["id"], repository, request.app.state.crypto, calendar_name
+            gcal.create_calendar, user["id"], repository, request.app.state.crypto, calendar_name,
+            request.app.state.metrics,
         )
     except Exception as exc:
         LOG.exception("Could not create the app-managed Google Calendar")
@@ -147,26 +162,27 @@ async def create_integration(payload: IntegrationRequest, request: Request, user
         raise HTTPException(status_code=500, detail="Could not save this integration") from exc
 
     try:
-        await asyncio.to_thread(
-            calendar_service.reconcile, integration, parsed,
-            emit_notifications=False, sync_trigger="integration_created",
-        )
         cache = repository.get_source_cache(source_url)
-        if cache:
-            repository.mark_reconciled(integration["id"], cache["content_sha256"])
-        notice = repository.create_sync_completion_notification(integration, "integration_created")
-        calendar_service.publish_notifications([notice])
-    except Exception as exc:
-        LOG.exception("Initial calendar reconciliation failed")
-        _record_sync_failure(repository, calendar_service, integration, "integration_created")
+        await request.app.state.job_queue.enqueue(
+            "reconcile",
+            {"integration_id": integration["id"], "user_id": user["id"], "source_url": source_url,
+             "expected_sha256": cache["content_sha256"] if cache else None,
+             "emit_notifications": False},
+            trigger="integration_created",
+            dedupe_key=f"initial-reconcile:{integration['id']}",
+        )
+    except QueueFullError as exc:
+        LOG.warning("Could not queue initial reconciliation because queue is full integration=%s", integration["id"])
         repository.delete_integration(integration["id"], user["id"])
         await _delete_unclaimed_calendar(user["id"], calendar_id, request, repository)
-        raise HTTPException(status_code=502, detail="The calendar was created, but the initial schedule sync failed") from exc
-    return _public(repository.get_integration(integration["id"], user["id"]))
+        raise HTTPException(status_code=503, detail="The service is busy; try setting up the integration again") from exc
+    return {**_public(repository.get_integration(integration["id"], user["id"])),
+            "initial_sync_status": "queued"}
 
 
 @router.patch("/{integration_id}", dependencies=[Depends(require_csrf)])
-async def update_integration(integration_id: str, payload: GroupUpdate, request: Request, user: dict = Depends(current_user)) -> dict:
+async def update_integration(integration_id: str, payload: GroupUpdate, request: Request,
+                             response: Response, user: dict = Depends(current_user)) -> dict:
     repository, calendar_service = _services(request)
     existing = repository.get_integration(integration_id, user["id"])
     if not existing:
@@ -204,24 +220,26 @@ async def update_integration(integration_id: str, payload: GroupUpdate, request:
         payload.calendar_name,
     )
     try:
-        await asyncio.to_thread(
-            calendar_service.reconcile, integration, parsed,
-            emit_notifications=False, sync_trigger="integration_changed",
-        )
         cache = repository.get_source_cache(integration["source_url"])
-        if cache:
-            repository.mark_reconciled(integration_id, cache["content_sha256"])
-        notice = repository.create_sync_completion_notification(integration, "integration_changed")
-        calendar_service.publish_notifications([notice])
-    except Exception as exc:
-        LOG.exception("Could not reconcile after group change")
-        _record_sync_failure(repository, calendar_service, integration, "integration_changed")
-        raise HTTPException(status_code=502, detail="Group was saved, but the calendar could not be reconciled") from exc
-    return _public(repository.get_integration(integration_id, user["id"]))
+        await request.app.state.job_queue.enqueue(
+            "reconcile",
+            {"integration_id": integration_id, "user_id": user["id"],
+             "source_url": integration["source_url"],
+             "expected_sha256": cache["content_sha256"] if cache else None,
+             "emit_notifications": False},
+            trigger="integration_changed",
+            dedupe_key=f"integration-change:{integration_id}:{integration['updated_at']}",
+        )
+        response.status_code = 202
+    except QueueFullError as exc:
+        raise HTTPException(status_code=503, detail="The group was saved, but the service is busy; sync it again shortly") from exc
+    return {**_public(repository.get_integration(integration_id, user["id"])),
+            "sync_status": "queued"}
 
 
-@router.post("/{integration_id}/sync", dependencies=[Depends(require_csrf)])
-async def sync_now(integration_id: str, request: Request, user: dict = Depends(current_user)) -> dict:
+@router.post("/{integration_id}/sync", status_code=202, dependencies=[Depends(require_csrf)])
+async def sync_now(integration_id: str, request: Request, response: Response,
+                   user: dict = Depends(current_user)) -> dict:
     repository, calendar_service = _services(request)
     integration = repository.get_integration(integration_id, user["id"])
     if not integration:
@@ -230,20 +248,18 @@ async def sync_now(integration_id: str, request: Request, user: dict = Depends(c
     if not accepted:
         if eligible_at is None:
             raise HTTPException(status_code=404, detail="Integration not found")
+        response.status_code = 200
         return {"status": "skipped", "retry_at": eligible_at}
+    reserved = repository.get_integration(integration_id, user["id"])
     try:
-        result = await calendar_service.sync_integration(integration, force_remote_read=True)
-        current = repository.get_integration(integration_id, user["id"])
-        if current:
-            notice = repository.create_sync_completion_notification(current, "manual")
-            calendar_service.publish_notifications([notice])
-        return {"status": "synced", **result}
-    except Exception as exc:
-        LOG.exception("Manual sync failed integration=%s", integration_id)
-        current = repository.get_integration(integration_id, user["id"])
-        if current:
-            _record_sync_failure(repository, calendar_service, current, "manual")
-        raise HTTPException(status_code=502, detail="Could not sync this schedule right now") from exc
+        await request.app.state.job_queue.enqueue(
+            "manual_sync", {"integration_id": integration_id, "user_id": user["id"]},
+            trigger="manual", dedupe_key=None,
+        )
+    except QueueFullError as exc:
+        repository.release_manual_sync(integration_id, user["id"], reserved.get("last_sync_at"))
+        raise HTTPException(status_code=503, detail="The service is busy; retry shortly", headers={"Retry-After": "60"}) from exc
+    return {"status": "queued"}
 
 
 @router.delete("/{integration_id}", dependencies=[Depends(require_csrf)])
@@ -252,6 +268,9 @@ async def delete_integration(integration_id: str, request: Request, user: dict =
     integration = repository.get_integration(integration_id, user["id"])
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
+    await request.app.state.job_queue.cancel(
+        lambda _kind, payload: payload.get("integration_id") == integration_id
+    )
     try:
         calendar_deleted = await asyncio.to_thread(calendar_service.delete_integration, integration)
     except Exception as exc:

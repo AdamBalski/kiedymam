@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 import logging
 import re
+import time
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
@@ -40,9 +41,10 @@ def _valid_vapid_subject(value: str) -> bool:
 
 
 class PushService:
-    def __init__(self, repository: Repository, crypto: EnvelopeCrypto, settings):
+    def __init__(self, repository: Repository, crypto: EnvelopeCrypto, settings, metrics=None):
         self.repository = repository
         self.crypto = crypto
+        self.metrics = metrics
         self.private_key = None
         self.public_key = None
         self.subject = (settings.web_push_subject or "").strip()
@@ -98,17 +100,20 @@ class PushService:
     def configured(self) -> bool:
         return bool(self.subject_valid and self.public_key and self.private_key)
 
-    def send_notifications(self, notifications: list[dict]) -> None:
+    def send_notifications(self, notifications: list[dict]) -> dict[str, int]:
+        totals = {"attempted": 0, "accepted": 0, "expired": 0, "failed": 0}
         if not notifications or not self.configured:
-            return
+            return totals
         try:
             from pywebpush import WebPushException, webpush
         except ImportError:
             LOG.warning("Push is configured but pywebpush is unavailable")
-            return
+            return totals
         for notification in notifications:
             for record in self.repository.push_subscriptions(notification["user_id"], self.crypto):
                 endpoint = record["subscription"].get("endpoint", "")
+                started = time.monotonic()
+                totals["attempted"] += 1
                 try:
                     webpush(
                         subscription_info=record["subscription"],
@@ -122,12 +127,26 @@ class PushService:
                         vapid_claims={"sub": self.subject},
                         timeout=10,
                     )
+                    totals["accepted"] += 1
+                    outcome = "accepted"
                 except WebPushException as exc:
                     status = getattr(getattr(exc, "response", None), "status_code", None)
                     if status in (404, 410):
+                        totals["expired"] += 1
+                        outcome = "expired"
                         self.repository.delete_push_subscription_by_hash(
                             sha256(endpoint.encode("utf-8")).hexdigest()
                         )
+                    else:
+                        totals["failed"] += 1
+                        outcome = "failed"
                     LOG.info("Push delivery failed status=%s", status)
                 except Exception:
+                    totals["failed"] += 1
+                    outcome = "failed"
                     LOG.exception("Push delivery failed")
+                if self.metrics:
+                    attributes = {"outcome": outcome}
+                    self.metrics.add_counter("push.delivery.count", 1, attributes)
+                    self.metrics.observe("push.delivery.duration", time.monotonic() - started, attributes)
+        return totals

@@ -2,6 +2,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -17,6 +18,9 @@ class Settings:
     log_level: str
     web_push_secret_ocid: str
     web_push_subject: str
+    metrics_database_path: str
+    admin_email: str
+    service_version: str
 
     @property
     def google_redirect_uri(self) -> str:
@@ -91,9 +95,10 @@ def load_settings() -> Settings:
             raise RuntimeError("APP_BASE_PATH cannot contain dot segments")
         base_path = "/" + "/".join(segments)
 
+    database_path = os.environ.get("DATABASE_PATH", "/data/umb-syncer.sqlite3")
     return Settings(
         port=_port_from_env(),
-        database_path=os.environ.get("DATABASE_PATH", "/data/umb-syncer.sqlite3"),
+        database_path=database_path,
         app_origin=origin,
         app_base_path=base_path,
         google_client=client,
@@ -104,6 +109,11 @@ def load_settings() -> Settings:
         web_push_subject=os.environ.get(
             "WEB_PUSH_VAPID_SUBJECT", "https://change.me"
         ).strip(),
+        metrics_database_path=os.environ.get(
+            "METRICS_DATABASE_PATH", str(Path(database_path).with_name("metrics.sqlite3"))
+        ),
+        admin_email=os.environ.get("ADMIN_EMAIL", "").strip().casefold(),
+        service_version=os.environ.get("APP_VERSION", os.environ.get("GITHUB_SHA", "unknown")).strip() or "unknown",
     )
 
 

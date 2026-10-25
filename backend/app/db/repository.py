@@ -23,6 +23,15 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_user_by_email(self, email: str) -> dict | None:
+        with self.database.read() as db:
+            row = db.execute("SELECT id,email,display_name FROM users WHERE lower(email)=lower(?)", (email.strip(),)).fetchone()
+        return dict(row) if row else None
+
+    def active_integration_count(self) -> int:
+        with self.database.read() as db:
+            return int(db.execute("SELECT COUNT(*) FROM integrations").fetchone()[0])
+
     def get_feedback(self, user_id: str) -> dict | None:
         with self.database.read() as db:
             row = db.execute(
@@ -50,6 +59,43 @@ class Repository:
         with self.database.transaction(immediate=True) as db:
             cursor = db.execute("DELETE FROM user_feedback WHERE user_id=?", (user_id,))
         return cursor.rowcount > 0
+
+    def reserve_workbook_inspection(
+        self, user_id: str, source_url: str, *, limit: int = 5, interval_seconds: int = 3600
+    ) -> tuple[bool, float | None]:
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - interval_seconds
+        with self.database.transaction(immediate=True) as db:
+            row = db.execute(
+                "SELECT inspection_attempts_json FROM user_limits WHERE user_id=?", (user_id,)
+            ).fetchone()
+            try:
+                attempts = json.loads(row["inspection_attempts_json"]) if row else []
+            except (TypeError, json.JSONDecodeError):
+                attempts = []
+            attempts = [
+                item for item in attempts
+                if isinstance(item, dict) and isinstance(item.get("timestamp"), (int, float))
+                and item["timestamp"] > cutoff
+            ]
+            if len(attempts) >= limit:
+                retry_at = min(item["timestamp"] for item in attempts) + interval_seconds
+                db.execute(
+                    "INSERT INTO user_limits(user_id,inspection_attempts_json,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET inspection_attempts_json=excluded.inspection_attempts_json,updated_at=excluded.updated_at",
+                    (user_id, json.dumps(attempts, separators=(",", ":")), now.isoformat(timespec="seconds")),
+                )
+                return False, retry_at
+            attempts.append({"timestamp": now.timestamp(), "source_url": source_url})
+            encoded = json.dumps(attempts, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) >= 16 * 1024:
+                raise ValueError("Workbook inspection history exceeded its size limit")
+            db.execute(
+                "INSERT INTO user_limits(user_id,inspection_attempts_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET inspection_attempts_json=excluded.inspection_attempts_json,updated_at=excluded.updated_at",
+                (user_id, encoded, now.isoformat(timespec="seconds")),
+            )
+        return True, None
 
     def get_integration(self, integration_id: str, user_id: str | None = None) -> dict | None:
         sql = "SELECT * FROM integrations WHERE id=?"
@@ -145,6 +191,16 @@ class Repository:
         now = utc_now()
         with self.database.transaction(immediate=True) as db:
             db.execute("UPDATE integrations SET last_sync_at=?, updated_at=? WHERE id=?", (now, now, integration_id))
+
+    def release_manual_sync(self, integration_id: str, user_id: str, reserved_at: str | None) -> bool:
+        if not reserved_at:
+            return False
+        with self.database.transaction(immediate=True) as db:
+            cursor = db.execute(
+                "UPDATE integrations SET last_sync_at=NULL WHERE id=? AND user_id=? AND last_sync_at=?",
+                (integration_id, user_id, reserved_at),
+            )
+        return cursor.rowcount > 0
 
     def mark_reconciled(self, integration_id: str, digest: str) -> None:
         with self.database.transaction(immediate=True) as db:

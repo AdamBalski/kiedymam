@@ -1,9 +1,10 @@
-export default function MainNavigation({ tab, setTab, email, onLogout, clearMessages }) {
+export default function MainNavigation({ tab, setTab, email, isAdmin, onLogout, clearMessages }) {
   const pages = [
     ["plan", "Plan"],
     ["notifications", "Powiadomienia"],
     ["changelog", "Dziennik zmian"],
   ];
+  if (isAdmin) pages.push(["metrics", "Metrics"]);
 
   function selectPage(nextTab) {
     setTab(nextTab);

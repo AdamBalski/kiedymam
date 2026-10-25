@@ -4,10 +4,19 @@ services:
     build: .
     restart: unless-stopped
     network_mode: host
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       HOST: 127.0.0.1
       PORT: 8080
       DATABASE_PATH: /data/umb-syncer.sqlite3
+      METRICS_DATABASE_PATH: /data/metrics.sqlite3
+      APP_VERSION: ${UMB_SYNCER_VERSION:-unknown}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       APP_ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN to the public HTTPS origin}
       APP_BASE_PATH: ${APP_BASE_PATH:-}
       GOOGLE_OAUTH_CLIENT_JSON: ${GOOGLE_OAUTH_CLIENT_JSON:?Set GOOGLE_OAUTH_CLIENT_JSON}

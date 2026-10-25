@@ -9,7 +9,6 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [deleting, setDeleting] = useState(false);
-
   useEffect(() => {
     setGroupNumber(String(integration.group_number));
     setCalendarName(integration.calendar_name || "");
@@ -34,7 +33,9 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
     try {
       const result = await api.updateGroup(integration.id, payload);
       onChanged(result);
-      setSuccess("Zapisano ustawienia i zaktualizowano kalendarz.");
+      setSuccess(result.sync_status === "queued"
+        ? "Zapisano ustawienia. Aktualizacja kalendarza jest w kolejce; otrzymasz powiadomienie po jej zakończeniu."
+        : "Zapisano ustawienia kalendarza.");
     } catch (error) {
       setError(error.message);
       const current = await api.integrations().catch(() => []);
@@ -53,8 +54,7 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
       if (result.status === "skipped") {
         setSuccess(`Synchronizacja była niedawno uruchomiona. Spróbuj po ${dateTime(result.retry_at * 1000)}.`);
       } else {
-        setSuccess("Plan został sprawdzony i kalendarz jest aktualny.");
-        onChanged(await api.integrations().then((rows) => rows[0]));
+        setSuccess("Synchronizacja została dodana do kolejki. Otrzymasz powiadomienie po jej zakończeniu.");
       }
     } catch (error) {
       setError(error.message);

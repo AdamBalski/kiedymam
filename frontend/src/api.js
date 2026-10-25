@@ -54,4 +54,7 @@ export const api = {
   saveFeedback: (body) => request("/api/feedback", { method: "PUT", body: { body } }),
   deleteFeedback: () => request("/api/feedback", { method: "DELETE" }),
   changelog: () => request("/api/changelog"),
+  metricCatalog: () => request("/api/admin/metrics/catalog"),
+  queryMetrics: (body) => request("/api/admin/metrics/query", { method: "POST", body }),
+  sendTestPush: (body) => request("/api/admin/send-push", { method: "POST", body }),
 };

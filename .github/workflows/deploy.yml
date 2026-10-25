@@ -60,13 +60,62 @@ jobs:
             printf 'export UMB_SYNCER_VERSION=%q\n' "$SHA"
             printf 'export APP_ORIGIN=%q\n' "$APP_ORIGIN"
             printf 'export APP_BASE_PATH=%q\n' "$APP_BASE_PATH"
-            printf 'export OCI_SECRET_OCID=%q\n' "$OCI_SECRET_OCID"
             printf 'export LOG_LEVEL=%q\n' "${LOG_LEVEL:-INFO}"
             printf 'export GOOGLE_OAUTH_CLIENT_JSON=%q\n' "$GOOGLE_OAUTH_CLIENT_JSON"
             cat <<'REMOTE'
           set -euo pipefail
           compose_file="/home/${DEPLOY_USER}/infra/compose/umb-syncer.yml"
+          docker system df
+          docker system prune -af --filter until=24h
+          available_kb=$(df -Pk /var/lib/docker | awk 'NR == 2 {print $4}')
+          if [ -z "$available_kb" ] || [ "$available_kb" -lt 2097152 ]; then
+            echo "Deployment stopped: Docker filesystem has less than 2 GiB free." >&2
+            exit 1
+          fi
+          previous_id=$(docker compose -f "$compose_file" ps -q umb-syncer || true)
+          previous_volume=""
+          previous_image=""
+          if [ -n "$previous_id" ]; then
+            previous_volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$previous_id")
+            previous_image=$(docker inspect --format '{{.Config.Image}}' "$previous_id")
+          fi
+          previous_version="${previous_image##*:}"
+          report_deploy_failure() {
+            status=$?
+            trap - ERR
+            if [ -n "$previous_version" ]; then
+              echo "Deployment failed; previous image $previous_image is retained for recovery." >&2
+            else
+              echo "Deployment failed; no previous container image was available." >&2
+            fi
+            echo "Persistent /data volume $previous_volume was not pruned or reset." >&2
+            exit "$status"
+          }
+          trap report_deploy_failure ERR
           docker compose -f "$compose_file" pull
           docker compose -f "$compose_file" up -d --no-build --wait
+          container_id=$(docker compose -f "$compose_file" ps -q umb-syncer)
+          expected_image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):${UMB_SYNCER_VERSION}"
+          actual_image=$(docker inspect --format '{{.Config.Image}}' "$container_id")
+          if [ "$actual_image" != "$expected_image" ]; then
+            echo "Deployment smoke check failed: expected $expected_image, running $actual_image" >&2
+            exit 1
+          fi
+          current_volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$container_id")
+          if [ -z "$current_volume" ] || { [ -n "$previous_volume" ] && [ "$current_volume" != "$previous_volume" ]; }; then
+            echo "Deployment smoke check failed: the persistent /data volume changed or is missing." >&2
+            exit 1
+          fi
+          if ! docker logs "$container_id" 2>&1 | grep -F 'Database migrations ready' >/dev/null; then
+            echo "Deployment smoke check failed: database migrations did not report successful initialization." >&2
+            exit 1
+          fi
+          if docker logs "$container_id" 2>&1 | grep -E 'Database migration .* failed|Traceback \(most recent call last\)' >/dev/null; then
+            echo "Deployment smoke check failed: startup logs contain a migration or exception failure." >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error --output /dev/null "${APP_ORIGIN}${APP_BASE_PATH:-}/"
+          curl --fail --silent --show-error "${APP_ORIGIN}${APP_BASE_PATH:-}/api/health"
+          trap - ERR
           REMOTE
           } | ssh -p "${DEPLOY_PORT:-22}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -s"

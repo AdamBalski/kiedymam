@@ -104,6 +104,22 @@ li { margin: .35em 0; }
 .push-status { max-width: 700px; }
 .device-current { display: inline-block; margin-left: .5em; padding: 0 .4em; color: #075d27; background: #f5fff5; font-size: .8em; font-weight: 600; }
 .device-agent { overflow-wrap: anywhere; }
+.metric-query { max-width: 100%; }
+.metric-dimensions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: .75em; margin: 1em 0; }
+.metric-dimension { min-width: 0; padding: .75em; border: 1px solid #aaa; }
+.metric-dimension .checkbox-option { margin-bottom: 0; }
+.metric-histogram { margin: 1em 0; }
+.metric-time-range { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: .75em; }
+.metric-chart-wrap { overflow-x: auto; }
+.metric-chart { display: block; min-width: 520px; width: 100%; }
+.metric-legend { display: flex; flex-wrap: wrap; gap: .8em; font-size: .85em; }
+.metric-legend span { display: inline-flex; align-items: center; gap: .35em; }
+.metric-legend i { display: inline-block; width: .8em; height: .8em; }
+.table-scroll { max-width: 100%; overflow-x: auto; }
+.metric-table { width: 100%; border-collapse: collapse; }
+.metric-table th, .metric-table td { padding: .45em; border: 1px solid #aaa; text-align: left; white-space: nowrap; }
+.metric-table th { background: #eee; }
+.admin-push-form { max-width: 650px; }
 
 @media (max-width: 560px) {
   body { padding: 14px; font-size: 16px; }

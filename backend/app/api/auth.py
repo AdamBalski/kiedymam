@@ -26,6 +26,12 @@ def current_user(request: Request) -> dict:
     user = google.get_session(database, request.cookies.get(SESSION_COOKIE))
     if not user:
         raise HTTPException(status_code=401, detail="Sign in to continue")
+    metrics = getattr(request.app.state, "metrics", None)
+    if metrics:
+        metrics.add_counter(
+            "http.server.authenticated_request.count",
+            attributes={"user.email": user["email"].strip().casefold()},
+        )
     return user
 
 
@@ -108,8 +114,12 @@ async def google_callback(
 
 
 @router.get("/me")
-async def me(user: dict = Depends(current_user)) -> dict:
-    return {"id": user["id"], "email": user["email"], "display_name": user["display_name"]}
+async def me(request: Request, user: dict = Depends(current_user)) -> dict:
+    admin_email = request.app.state.settings.admin_email
+    return {
+        "id": user["id"], "email": user["email"], "display_name": user["display_name"],
+        "is_admin": bool(admin_email and user["email"].strip().casefold() == admin_email),
+    }
 
 
 @router.post("/logout")

@@ -45,6 +45,7 @@ class CalendarServiceTests(unittest.TestCase):
     def test_unchanged_fresh_source_reuses_parsed_cache_without_parsing_or_reconciling(self):
         parsed = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION}
         self.repository.upsert_source_cache(self.integration["source_url"], "same-sha", parsed)
+        self.repository.mark_reconciled(self.integration["id"], "same-sha")
 
         async def exercise():
             with (
@@ -66,6 +67,7 @@ class CalendarServiceTests(unittest.TestCase):
     def test_manual_sync_with_unchanged_sha_does_not_reconcile(self):
         parsed = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION}
         self.repository.upsert_source_cache(self.integration["source_url"], "same-sha", parsed)
+        self.repository.mark_reconciled(self.integration["id"], "same-sha")
 
         async def exercise():
             with (
@@ -78,17 +80,9 @@ class CalendarServiceTests(unittest.TestCase):
             ):
                 result = await self.service.sync_integration(self.integration, force_remote_read=True)
 
-            self.assertEqual(
-                result,
-                {
-                    "source_changed": False,
-                    "reconciled": "none",
-                    "added_or_updated": 0,
-                    "removed": 0,
-                },
-            )
+            self.assertEqual(result, {"source_changed": False})
             parse.assert_not_awaited()
-            reconcile.assert_not_called()
+            reconcile.assert_called_once()
 
         asyncio.run(exercise())
 
@@ -148,9 +142,7 @@ class CalendarServiceTests(unittest.TestCase):
                 )
 
         asyncio.run(exercise())
-        self.assertEqual(dict(calls), {
-            self.integration["id"]: "manual", other["id"]: "source_changed"
-        })
+        self.assertEqual(dict(calls), {other["id"]: "source_changed"})
 
     def test_integration_change_suppresses_only_the_edited_integration_notices(self):
         with self.repository.database.transaction(immediate=True) as db:

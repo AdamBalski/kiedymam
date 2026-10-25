@@ -4,7 +4,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import re
 from threading import Lock
-from typing import Protocol
+from typing import Callable, Protocol
 from urllib.parse import unquote, urlsplit
 
 from app.calendar.parser import ScheduleParseError
@@ -119,7 +119,10 @@ def format_for_url(url: str) -> str | None:
     return None
 
 
-def parse_workbook_for_url(contents: bytes, url: str | None) -> dict:
+def parse_workbook_for_url(
+    contents: bytes, url: str | None,
+    on_parser_result: Callable[[int, bool, str | None], None] | None = None,
+) -> dict:
     preferred = format_for_url(url) if url else None
     link_key = urlsplit(url)._replace(query="", fragment="").geturl() if url else None
     remembered = None
@@ -132,7 +135,7 @@ def parse_workbook_for_url(contents: bytes, url: str | None) -> dict:
     ordered_candidates = ([preferred] if preferred else []) + list(FALLBACK_FORMATS)
     formats.extend(format_id for format_id in ordered_candidates if format_id not in formats)
     failures: list[str] = []
-    for format_id in formats:
+    for attempt, format_id in enumerate(formats, start=1):
         try:
             result = PARSER_REGISTRY[format_id].parser.parse(contents)
         except Exception as exc:
@@ -150,6 +153,12 @@ def parse_workbook_for_url(contents: bytes, url: str | None) -> dict:
                 _remembered_parsers.move_to_end(link_key)
                 while len(_remembered_parsers) > MAX_REMEMBERED_LINKS:
                     _remembered_parsers.popitem(last=False)
+        if on_parser_result:
+            fallback = (bool(preferred and format_id != preferred)
+                        or (not preferred and attempt > 1))
+            on_parser_result(attempt, fallback, format_id)
         return _with_group_metadata(result, format_id)
+    if on_parser_result:
+        on_parser_result(len(formats), len(formats) > 1, None)
     detail = "; ".join(failures)
     raise ScheduleParseError(f"No timetable parser accepted this workbook ({detail})")

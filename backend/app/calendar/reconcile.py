@@ -27,6 +27,7 @@ def reconcile_integration(
     *,
     emit_notifications: bool = True,
     sync_trigger: str = "scheduled",
+    metrics=None,
 ) -> dict:
     group_number = int(integration["group_number"])
     selected = {
@@ -35,12 +36,15 @@ def reconcile_integration(
         if _applies_to_group(event, group_number)
     }
     existing = repository.get_calendar_events(integration["id"])
-    service = gcal.calendar_api(integration["user_id"], repository, crypto)
-    current_calendar = service.calendars().get(calendarId=integration["calendar_id"]).execute(num_retries=2)
+    service = gcal.calendar_api(integration["user_id"], repository, crypto, metrics)
+    current_calendar = gcal.execute(
+        service.calendars().get(calendarId=integration["calendar_id"]),
+        operation="google.calendar.calendars.get", metrics=metrics, num_retries=2,
+    )
     if current_calendar.get("summary") != integration["calendar_name"]:
-        service.calendars().patch(
+        gcal.execute(service.calendars().patch(
             calendarId=integration["calendar_id"], body={"summary": integration["calendar_name"]}
-        ).execute(num_retries=2)
+        ), operation="google.calendar.calendars.patch", metrics=metrics, num_retries=2)
     updated: dict[str, dict] = {}
     changes: list[tuple[str, dict]] = []
 
@@ -53,23 +57,23 @@ def reconcile_integration(
             updated[event_key] = prior
             continue
         if prior:
-            service.events().update(
+            gcal.execute(service.events().update(
                 calendarId=integration["calendar_id"], eventId=event_id, body=body, sendUpdates="none"
-            ).execute(num_retries=2)
+            ), operation="google.calendar.events.update", metrics=metrics, num_retries=2)
             action = "updated"
         else:
             try:
-                service.events().insert(
+                gcal.execute(service.events().insert(
                     calendarId=integration["calendar_id"], body=body, sendUpdates="none"
-                ).execute(num_retries=2)
+                ), operation="google.calendar.events.insert", metrics=metrics, num_retries=2)
                 action = "added"
             except HttpError as error:
                 if gcal.http_error_status(error) != 409:
                     raise
                 # The deterministic Google event ID makes retries safe after a partial run.
-                service.events().update(
+                gcal.execute(service.events().update(
                     calendarId=integration["calendar_id"], eventId=event_id, body=body, sendUpdates="none"
-                ).execute(num_retries=2)
+                ), operation="google.calendar.events.update", metrics=metrics, num_retries=2)
                 action = "added"
         updated[event_key] = {
             "google_event_id": event_id,
@@ -81,13 +85,17 @@ def reconcile_integration(
         if event_key in selected:
             continue
         try:
-            service.events().delete(
+            gcal.execute(service.events().delete(
                 calendarId=integration["calendar_id"], eventId=prior["google_event_id"], sendUpdates="none"
-            ).execute(num_retries=2)
+            ), operation="google.calendar.events.delete", metrics=metrics, num_retries=2)
         except HttpError as error:
             if gcal.http_error_status(error) != 404:
                 raise
         changes.append(("removed", prior["event"].get("schedule", {})))
+
+    change_counts = {"added": 0, "updated": 0, "removed": 0}
+    for action, _event in changes:
+        change_counts[action] += 1
 
     notifications = repository.replace_calendar_events(
         integration, updated, changes,
@@ -100,6 +108,7 @@ def reconcile_integration(
         sum(action == "removed" for action, _ in changes),
     )
     return {
+        **change_counts,
         "added_or_updated": sum(action != "removed" for action, _ in changes),
         "removed": sum(action == "removed" for action, _ in changes),
         "notifications": notifications,

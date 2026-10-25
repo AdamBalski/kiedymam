@@ -25,11 +25,17 @@ class MigrationTests(unittest.TestCase):
             versions = [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")]
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
-        self.assertEqual(versions, [1, 2, 3, 4, 5])
+        self.assertEqual(versions, list(range(1, len(Database._load_migrations()) + 1)))
         self.assertIn("users", tables)
         self.assertIn("timetable_links", tables)
         self.assertIn("push_subscriptions", tables)
         self.assertIn("user_feedback", tables)
+        for removed_table in (
+            "admin_test_push_audit", "integration_failure_streaks",
+            "service_runtime_state", "app_preferences", "user_activity_events",
+            "daily_operational_summaries",
+        ):
+            self.assertNotIn(removed_table, tables)
         with self.database.read() as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(push_subscriptions)")}
         self.assertIn("device_name", columns)
@@ -47,7 +53,7 @@ class MigrationTests(unittest.TestCase):
             self.assertIsNotNone(
                 db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='timetable_links'").fetchone()
             )
-            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertEqual(versions, list(range(1, len(Database._load_migrations()) + 1)))
             self.assertIsNotNone(
                 db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_feedback'").fetchone()
             )

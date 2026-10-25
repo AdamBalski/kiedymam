@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from hashlib import sha256
 import logging
+from threading import BoundedSemaphore
 import time
 from zoneinfo import ZoneInfo
 
@@ -17,9 +18,27 @@ from app.db.repository import Repository
 
 LOG = logging.getLogger(__name__)
 TIME_ZONE = "Europe/Warsaw"
+GOOGLE_API_OPERATIONS = BoundedSemaphore(16)
 
 
-def _credentials(user_id: str, repository: Repository, crypto: EnvelopeCrypto) -> Credentials:
+def execute(request, *, operation: str = "google.calendar.api", metrics=None, **kwargs):
+    """Run one blocking Google API operation under the process-wide bound."""
+    started = time.monotonic()
+    outcome = "success"
+    try:
+        with GOOGLE_API_OPERATIONS:
+            return request.execute(**kwargs)
+    except Exception:
+        outcome = "failure"
+        raise
+    finally:
+        if metrics:
+            attributes = {"operation.name": operation, "outcome": outcome}
+            metrics.add_counter("google.calendar.api.call.count", attributes=attributes)
+            metrics.observe("google.calendar.api.call.duration", time.monotonic() - started, attributes)
+
+
+def _credentials(user_id: str, repository: Repository, crypto: EnvelopeCrypto, metrics=None) -> Credentials:
     payload = load_credentials(crypto, user_id)
     # google-auth expects a naive UTC expiry and compares it with utcnow().
     expiry = datetime.fromtimestamp(int(payload.get("expires_at", 0)), timezone.utc).replace(tzinfo=None)
@@ -35,7 +54,19 @@ def _credentials(user_id: str, repository: Repository, crypto: EnvelopeCrypto) -
     if not credentials.valid or credentials.expired:
         if not credentials.refresh_token:
             raise RuntimeError("Google authorization expired; sign in again")
-        credentials.refresh(Request())
+        started = time.monotonic()
+        outcome = "success"
+        try:
+            with GOOGLE_API_OPERATIONS:
+                credentials.refresh(Request())
+        except Exception:
+            outcome = "failure"
+            raise
+        finally:
+            if metrics:
+                attributes = {"operation.name": "google.oauth.token.refresh", "outcome": outcome}
+                metrics.add_counter("google.oauth.refresh.count", attributes=attributes)
+                metrics.observe("google.oauth.refresh.duration", time.monotonic() - started, attributes)
         payload.update({
             "access_token": credentials.token,
             "refresh_token": credentials.refresh_token,
@@ -45,28 +76,31 @@ def _credentials(user_id: str, repository: Repository, crypto: EnvelopeCrypto) -
     return credentials
 
 
-def calendar_api(user_id: str, repository: Repository, crypto: EnvelopeCrypto):
-    credentials = _credentials(user_id, repository, crypto)
+def calendar_api(user_id: str, repository: Repository, crypto: EnvelopeCrypto, metrics=None):
+    credentials = _credentials(user_id, repository, crypto, metrics)
     return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
 
-def create_calendar(user_id: str, repository: Repository, crypto: EnvelopeCrypto, calendar_name: str) -> str:
-    service = calendar_api(user_id, repository, crypto)
-    result = service.calendars().insert(body={"summary": calendar_name, "timeZone": TIME_ZONE}).execute(num_retries=2)
+def create_calendar(user_id: str, repository: Repository, crypto: EnvelopeCrypto, calendar_name: str, metrics=None) -> str:
+    service = calendar_api(user_id, repository, crypto, metrics)
+    result = execute(service.calendars().insert(body={"summary": calendar_name, "timeZone": TIME_ZONE}),
+                     operation="google.calendar.calendars.insert", metrics=metrics, num_retries=2)
     calendar_id = result.get("id")
     if not calendar_id:
         raise RuntimeError("Google did not return the new calendar identifier")
     return calendar_id
 
 
-def delete_calendar(user_id: str, calendar_id: str, repository: Repository, crypto: EnvelopeCrypto) -> None:
-    calendar_api(user_id, repository, crypto).calendars().delete(calendarId=calendar_id).execute(num_retries=2)
+def delete_calendar(user_id: str, calendar_id: str, repository: Repository, crypto: EnvelopeCrypto, metrics=None) -> None:
+    execute(calendar_api(user_id, repository, crypto, metrics).calendars().delete(calendarId=calendar_id),
+            operation="google.calendar.calendars.delete", metrics=metrics, num_retries=2)
 
 
-def rename_calendar(user_id: str, calendar_id: str, calendar_name: str, repository: Repository, crypto: EnvelopeCrypto) -> None:
-    calendar_api(user_id, repository, crypto).calendars().patch(
+def rename_calendar(user_id: str, calendar_id: str, calendar_name: str, repository: Repository,
+                    crypto: EnvelopeCrypto, metrics=None) -> None:
+    execute(calendar_api(user_id, repository, crypto, metrics).calendars().patch(
         calendarId=calendar_id, body={"summary": calendar_name}
-    ).execute(num_retries=2)
+    ), operation="google.calendar.calendars.patch", metrics=metrics, num_retries=2)
 
 
 def event_identifier(integration_id: str, event_key: str) -> str:

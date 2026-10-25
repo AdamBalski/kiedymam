@@ -75,9 +75,9 @@ async def download_and_hash(url: str) -> tuple[str, bytes]:
     return digest, contents
 
 
-async def parse_downloaded_source(contents: bytes, url: str) -> dict:
+async def parse_downloaded_source(contents: bytes, url: str, on_parser_result=None) -> dict:
     canonical = canonicalize_xlsx_url(url)
-    return await asyncio.to_thread(parse_workbook_for_url, contents, canonical)
+    return await asyncio.to_thread(parse_workbook_for_url, contents, canonical, on_parser_result)
 
 
 async def fetch_and_parse(url: str) -> tuple[str, dict]:
