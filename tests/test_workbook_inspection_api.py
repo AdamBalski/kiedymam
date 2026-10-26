@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -40,6 +41,15 @@ class WorkbookInspectionApiTests(unittest.TestCase):
                             "INSERT INTO users(id,google_sub,email,display_name,created_at) VALUES(?,?,?,?,?)",
                             (user["id"], "inspection-google", user["email"], user["display_name"],
                              "2026-10-26T10:00:00+00:00"),
+                        )
+                        old_attempts = json.dumps([
+                            {"timestamp": time.time() - 30 + index,
+                             "source_url": "https://www.umb.edu.pl/plany/example.xlsx"}
+                            for index in range(5)
+                        ])
+                        db.execute(
+                            "INSERT INTO user_limits(user_id,inspection_attempts_json,updated_at) VALUES(?,?,?)",
+                            (user["id"], old_attempts, "2026-10-26T10:00:00+00:00"),
                         )
                     with patch.object(
                         client.app.state.calendar_service,

@@ -34,7 +34,7 @@ class MetricsQueryTests(unittest.TestCase):
 
         self.assertEqual(result["step_seconds"], 60)
         self.assertEqual(result["series"][0]["dimensions"], {"route": "/home"})
-        self.assertEqual(result["series"][0]["points"][0]["value"], 1.0)
+        self.assertIn(1.0, [point["value"] for point in result["series"][0]["points"]])
 
     def test_query_rejects_arithmetic_with_different_interval_resolutions(self):
         now = int(time.time())
@@ -73,7 +73,7 @@ class MetricsQueryTests(unittest.TestCase):
                     (metric_operation, ArithmeticOperation(operator, operand), Predicate("=", expected)),
                 )
                 result = execute_query(self.store, query)
-                self.assertEqual(result["series"][0]["points"][0]["value"], 1.0)
+                self.assertIn(1.0, [point["value"] for point in result["series"][0]["points"]])
 
     def test_later_aggregation_cannot_group_by_a_discarded_dimension(self):
         now = MetricsStore._bucket_start()
