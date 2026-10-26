@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from app.api.admin import admin_user
 from app.api.auth import require_csrf
 from app.metrics.query import ArithmeticOperation as ArithmeticOperationSpec
+from app.metrics.query import Delta as DeltaSpec
 from app.metrics.query import MetricOperation as MetricOperationSpec
 from app.metrics.query import Predicate as PredicateSpec
 from app.metrics.query import QuerySpec
@@ -36,13 +37,22 @@ class Predicate(BaseModel):
     value: float = Field(description="Numeric literal compared with each current metric value.")
 
 
+class DeltaOperation(BaseModel):
+    """Replace each series with differences between adjacent samples."""
+
+    type: Literal["delta"]
+
+
 class ArithmeticOperation(BaseModel):
     type: Literal["arithmetic"]
     operator: Literal["add", "subtract", "multiply", "divide"]
     query: QueryRequest
 
 
-Operation = Annotated[MetricOperation | Predicate | ArithmeticOperation, Field(discriminator="type")]
+Operation = Annotated[
+    MetricOperation | Predicate | DeltaOperation | ArithmeticOperation,
+    Field(discriminator="type"),
+]
 
 
 class QueryRequest(BaseModel):
@@ -99,6 +109,8 @@ def _query_spec(payload: QueryRequest, store, depth: int = 0) -> QuerySpec:
             ))
         elif isinstance(operation, Predicate):
             operations.append(PredicateSpec(operator=operation.operator, value=operation.value))
+        elif isinstance(operation, DeltaOperation):
+            operations.append(DeltaSpec())
         else:
             operations.append(ArithmeticOperationSpec(
                 operator=operation.operator,
@@ -119,6 +131,8 @@ def _serialize_operations(operations: tuple) -> list[dict[str, Any]]:
                            "group_by": list(operation.group_by), "interval_seconds": operation.interval_seconds})
         elif isinstance(operation, PredicateSpec):
             result.append({"type": "predicate", "operator": operation.operator, "value": operation.value})
+        elif isinstance(operation, DeltaSpec):
+            result.append({"type": "delta"})
         else:
             query = operation.query
             result.append({

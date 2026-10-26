@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -51,6 +52,53 @@ class RepositoryTests(unittest.TestCase):
         accepted, retry_at = self.repository.reserve_manual_sync(self.integration["id"], "user-1")
         self.assertFalse(accepted)
         self.assertIsNotNone(retry_at)
+
+    def test_workbook_inspection_limit_counts_distinct_urls_per_user(self):
+        urls = [f"https://www.umb.edu.pl/plan-{index}.xlsx" for index in range(6)]
+        for url in urls[:5]:
+            accepted, retry_at = self.repository.reserve_workbook_inspection("user-1", url)
+            self.assertTrue(accepted)
+            self.assertIsNone(retry_at)
+
+        with self.database.read() as db:
+            attempts_before = json.loads(db.execute(
+                "SELECT inspection_attempts_json FROM user_limits WHERE user_id=?", ("user-1",)
+            ).fetchone()[0])
+        self.assertEqual(len(attempts_before), 5)
+
+        for _ in range(3):
+            accepted, retry_at = self.repository.reserve_workbook_inspection("user-1", urls[0])
+            self.assertTrue(accepted)
+            self.assertIsNone(retry_at)
+
+        accepted, retry_at = self.repository.reserve_workbook_inspection("user-1", urls[5])
+        self.assertFalse(accepted)
+        self.assertIsNotNone(retry_at)
+
+        with self.database.read() as db:
+            attempts_after = json.loads(db.execute(
+                "SELECT inspection_attempts_json FROM user_limits WHERE user_id=?", ("user-1",)
+            ).fetchone()[0])
+        self.assertEqual(len(attempts_after), 5)
+        self.assertEqual(
+            {item["source_url"] for item in attempts_after},
+            set(urls[:5]),
+        )
+
+    def test_workbook_inspection_limit_is_scoped_to_each_user(self):
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                "INSERT INTO users(id,google_sub,email,display_name,created_at) VALUES(?,?,?,?,?)",
+                ("user-2", "google-2", "other@example.edu", "Other", "2026-10-23T10:00:00+00:00"),
+            )
+
+        for index in range(5):
+            self.assertTrue(self.repository.reserve_workbook_inspection(
+                "user-1", f"https://www.umb.edu.pl/plan-{index}.xlsx"
+            )[0])
+        self.assertTrue(self.repository.reserve_workbook_inspection(
+            "user-2", "https://www.umb.edu.pl/plan-6.xlsx"
+        )[0])
 
     def test_group_change_invalidates_the_reconciliation_hash(self):
         self.repository.mark_reconciled(self.integration["id"], "known-hash")

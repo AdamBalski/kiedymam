@@ -39,7 +39,6 @@ class Database:
         if self.metrics is None:
             return
         attributes = {"operation.name": operation, "outcome": outcome}
-        self.metrics.add_counter("sqlite.operation.count", attributes=attributes)
         self.metrics.observe("sqlite.operation.duration", time.monotonic() - started, attributes)
 
     def connect(self) -> sqlite3.Connection:

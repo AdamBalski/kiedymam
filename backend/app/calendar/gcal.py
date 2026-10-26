@@ -34,7 +34,6 @@ def execute(request, *, operation: str = "google.calendar.api", metrics=None, **
     finally:
         if metrics:
             attributes = {"operation.name": operation, "outcome": outcome}
-            metrics.add_counter("google.calendar.api.call.count", attributes=attributes)
             metrics.observe("google.calendar.api.call.duration", time.monotonic() - started, attributes)
 
 
@@ -65,7 +64,6 @@ def _credentials(user_id: str, repository: Repository, crypto: EnvelopeCrypto, m
         finally:
             if metrics:
                 attributes = {"operation.name": "google.oauth.token.refresh", "outcome": outcome}
-                metrics.add_counter("google.oauth.refresh.count", attributes=attributes)
                 metrics.observe("google.oauth.refresh.duration", time.monotonic() - started, attributes)
         payload.update({
             "access_token": credentials.token,

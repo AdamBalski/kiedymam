@@ -176,13 +176,11 @@ class CalendarService:
                 if isinstance(status, int):
                     attributes["http.response.status_code"] = status
                 if self.metrics:
-                    self.metrics.add_counter("xlsx.download.count", attributes=attributes)
                     self.metrics.observe("xlsx.download.duration", monotonic() - download_started, attributes)
                 raise
             download_duration = monotonic() - download_started
             if self.metrics:
                 attributes = {"outcome": "success", "xlsx.url": self._metric_url(source_url)}
-                self.metrics.add_counter("xlsx.download.count", attributes=attributes)
                 self.metrics.add_counter("xlsx.download.bytes", len(contents), {"xlsx.url": self._metric_url(source_url)})
                 self.metrics.observe("xlsx.download.duration", download_duration, attributes)
         cache = self.repository.get_source_cache(source_url)
@@ -220,14 +218,12 @@ class CalendarService:
                 parsed = await parse_downloaded_source(contents, source_url, record_parser_result)
         except Exception:
             if self.metrics:
-                self.metrics.add_counter("xlsx.parser.result", attributes={"outcome": "failure", "xlsx.url": self._metric_url(source_url)})
                 self.metrics.observe("xlsx.parse.duration", monotonic() - parse_started,
                                      {"outcome": "failure", "xlsx.url": self._metric_url(source_url)})
             raise
         if self.metrics:
             parser_id = parsed.get("format_id", "unknown")
             attributes = {"parser.id": parser_id, "outcome": "success", "xlsx.url": self._metric_url(source_url)}
-            self.metrics.add_counter("xlsx.parser.result", attributes=attributes)
             self.metrics.add_counter("xlsx.event.count", len(parsed.get("events", [])), {"parser.id": parser_id, "xlsx.url": self._metric_url(source_url)})
             self.metrics.observe("xlsx.parse.duration", monotonic() - parse_started, attributes)
         parsed["_parser_version"] = PARSER_CACHE_VERSION

@@ -53,7 +53,6 @@ class MetricsStore:
         self.service_version = service_version or "unknown"
         self._lock = threading.Lock()
         self._counters: dict[tuple, float] = defaultdict(float)
-        self._counter_series: set[tuple] = set()
         self._gauges: dict[tuple, float] = {}
         self._histograms: dict[tuple, dict[str, Any]] = {}
         self._last_rollup_minute = -1
@@ -73,6 +72,8 @@ class MetricsStore:
             self._validate_name(name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError("Counter increments must be finite and non-negative")
+            if value == 0:
+                return
             attrs = _attrs_json(attributes)
         except Exception:
             LOG.exception("Could not record counter metric name=%s", name)
@@ -80,7 +81,6 @@ class MetricsStore:
         key = (name, attrs)
         bucket = self._bucket_start()
         with self._lock:
-            self._counter_series.add(key)
             self._counters[(name, attrs, bucket)] += value
 
     def set_gauge(self, name: str, value: float, attributes: dict[str, Any] | None = None) -> None:
@@ -120,16 +120,15 @@ class MetricsStore:
         current_bucket = self._bucket_start(timestamp)
         with self._lock:
             counters = dict(self._counters)
-            counter_series = set(self._counter_series)
             gauges = dict(self._gauges)
             histograms = dict(self._histograms)
             self._counters.clear()
             self._histograms.clear()
 
         points: list[tuple] = []
-        for name, attrs in counter_series:
-            value = counters.get((name, attrs, current_bucket), 0.0)
-            points.append((name, attrs, current_bucket, RAW_STEP, "counter", -1.0, 1, value, value, value))
+        for (name, attrs, bucket_start), value in counters.items():
+            if value > 0:
+                points.append((name, attrs, bucket_start, RAW_STEP, "counter", -1.0, 1, value, value, value))
         for (name, attrs), value in gauges.items():
             points.append((name, attrs, current_bucket, RAW_STEP, "gauge", -1.0, 1, value, value, value))
         for (name, attrs, bucket_start), record in histograms.items():
@@ -138,10 +137,6 @@ class MetricsStore:
             for bound, count in record["buckets"].items():
                 points.append((name, attrs, bucket_start, RAW_STEP, "hist_bucket", float(bound),
                                count, 0.0, None, None))
-        for (name, attrs, bucket_start), value in counters.items():
-            if bucket_start != current_bucket and (name, attrs, bucket_start) in counters:
-                points.append((name, attrs, bucket_start, RAW_STEP, "counter", -1.0, 1, value, value, value))
-
         try:
             self._write_points(points)
             minute = int(timestamp // 60)
@@ -379,6 +374,16 @@ class MetricsStore:
                 value = acc["max"]
             labels = dict(group_values)
             series[tuple(sorted(labels.items()))].append({"timestamp": slot, "value": value})
+        if kind == "counter" and not whole_range:
+            # Counters are stored sparsely: absence of a sample means zero increments.
+            # Materialize zero buckets only in the query response for dimensions that
+            # had at least one real sample in the requested range.
+            slots = range(int(start // step) * step, end, step)
+            for labels, points_for_series in series.items():
+                by_timestamp = {point["timestamp"]: point for point in points_for_series}
+                for slot in slots:
+                    by_timestamp.setdefault(slot, {"timestamp": slot, "value": 0.0})
+                series[labels] = [by_timestamp[slot] for slot in sorted(by_timestamp)]
         return {
             "metric": name, "type": kind,
             "step_seconds": step, "operation": operation,

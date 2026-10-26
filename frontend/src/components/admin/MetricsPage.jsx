@@ -21,8 +21,9 @@ function MetricChart({ series }) {
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
   const flatRange = Math.max(Math.abs(maxValue) * 0.1, 0.000001);
-  const domainMin = minValue === maxValue ? maxValue - flatRange : minValue;
-  const domainMax = maxValue;
+  const allZero = minValue === 0 && maxValue === 0;
+  const domainMin = allZero ? 0 : minValue === maxValue ? maxValue - flatRange : minValue;
+  const domainMax = allZero ? 1 : maxValue;
   const colors = ["#005a9c", "#c3423f", "#237a57", "#7b4ba1", "#b66a00", "#007c91"];
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
@@ -191,6 +192,13 @@ export default function MetricsPage({ setError, setSuccess }) {
     ]);
   }
 
+  function addDelta() {
+    setOperations((current) => current.length >= 16 ? current : [
+      ...current,
+      { type: "delta" },
+    ]);
+  }
+
   function addArithmetic() {
     const operand = catalog.find((item) => item.name !== selectedName) || selected;
     if (!operand) return;
@@ -226,6 +234,7 @@ export default function MetricsPage({ setError, setSuccess }) {
           if (operation.type === "predicate") {
             return { type: "predicate", operator: operation.operator, value: Number(operation.value) };
           }
+          if (operation.type === "delta") return { type: "delta" };
           return {
             type: "arithmetic",
             operator: operation.operator,
@@ -350,7 +359,9 @@ export default function MetricsPage({ setError, setSuccess }) {
               <label htmlFor={`predicate-value-${index}`}>Wartość</label>
               <input id={`predicate-value-${index}`} type="number" step="any" value={operation.value}
                 onChange={(event) => updateOperation(index, { value: event.target.value })} required />
-            </> : <>
+            </> : operation.type === "delta" ? <p className="muted">
+              Każda próbka staje się różnicą względem poprzedniej próbki tej samej serii. Pierwsza próbka znika, więc z N próbek zostaje N−1. Przy kumulującym się CPU pokazuje to czas CPU przyrostowo.
+            </p> : <>
               <label htmlFor={`arithmetic-operator-${index}`}>Działanie na zapytaniach</label>
               <select id={`arithmetic-operator-${index}`} value={operation.operator}
                 onChange={(event) => updateOperation(index, { operator: event.target.value })}>
@@ -415,6 +426,9 @@ export default function MetricsPage({ setError, setSuccess }) {
           </button>
           <button type="button" className="secondary-button" onClick={addPredicate} disabled={operations.length >= 16}>
             Dodaj predykat
+          </button>
+          <button type="button" className="secondary-button" onClick={addDelta} disabled={operations.length >= 16}>
+            Dodaj deltę
           </button>
           <button type="button" className="secondary-button" onClick={addArithmetic} disabled={operations.length >= 16 || catalog.length === 0}>
             Dodaj działanie na zapytaniu

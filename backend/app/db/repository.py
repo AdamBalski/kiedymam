@@ -73,20 +73,40 @@ class Repository:
                 attempts = json.loads(row["inspection_attempts_json"]) if row else []
             except (TypeError, json.JSONDecodeError):
                 attempts = []
-            attempts = [
-                item for item in attempts
-                if isinstance(item, dict) and isinstance(item.get("timestamp"), (int, float))
-                and item["timestamp"] > cutoff
-            ]
-            if len(attempts) >= limit:
-                retry_at = min(item["timestamp"] for item in attempts) + interval_seconds
+            recent_by_url = {}
+            for item in attempts:
+                if (not isinstance(item, dict)
+                        or not isinstance(item.get("timestamp"), (int, float))
+                        or item["timestamp"] <= cutoff
+                        or not isinstance(item.get("source_url"), str)):
+                    continue
+                url = item["source_url"]
+                recent_by_url[url] = max(float(item["timestamp"]), recent_by_url.get(url, 0.0))
+
+            if source_url in recent_by_url:
+                # Re-inspecting one workbook is allowed and does not consume another
+                # distinct-workbook slot or extend its existing slot's expiry.
+                pass
+            elif len(recent_by_url) >= limit:
+                retry_at = min(recent_by_url.values()) + interval_seconds
+                encoded = json.dumps(
+                    [{"timestamp": timestamp, "source_url": url}
+                     for url, timestamp in recent_by_url.items()],
+                    separators=(",", ":"),
+                )
                 db.execute(
                     "INSERT INTO user_limits(user_id,inspection_attempts_json,updated_at) VALUES(?,?,?) "
                     "ON CONFLICT(user_id) DO UPDATE SET inspection_attempts_json=excluded.inspection_attempts_json,updated_at=excluded.updated_at",
-                    (user_id, json.dumps(attempts, separators=(",", ":")), now.isoformat(timespec="seconds")),
+                    (user_id, encoded, now.isoformat(timespec="seconds")),
                 )
                 return False, retry_at
-            attempts.append({"timestamp": now.timestamp(), "source_url": source_url})
+            else:
+                recent_by_url[source_url] = now.timestamp()
+
+            attempts = [
+                {"timestamp": timestamp, "source_url": url}
+                for url, timestamp in recent_by_url.items()
+            ]
             encoded = json.dumps(attempts, ensure_ascii=False, separators=(",", ":"))
             if len(encoded.encode("utf-8")) >= 16 * 1024:
                 raise ValueError("Workbook inspection history exceeded its size limit")

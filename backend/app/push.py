@@ -147,6 +147,5 @@ class PushService:
                     LOG.exception("Push delivery failed")
                 if self.metrics:
                     attributes = {"outcome": outcome}
-                    self.metrics.add_counter("push.delivery.count", 1, attributes)
                     self.metrics.observe("push.delivery.duration", time.monotonic() - started, attributes)
         return totals

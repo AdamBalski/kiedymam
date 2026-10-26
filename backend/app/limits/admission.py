@@ -29,7 +29,6 @@ class BoundedAdmissionMiddleware:
         if route:
             attributes["http.route"] = route
         try:
-            metrics.add_counter("http.server.request.count", 1, attributes)
             metrics.observe("http.server.request.duration", duration, attributes)
             metrics.set_gauge("http.server.active_requests", active)
             metrics.set_gauge("http.server.queue.depth", queued)

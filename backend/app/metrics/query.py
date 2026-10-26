@@ -22,6 +22,11 @@ class Predicate:
 
 
 @dataclass(frozen=True)
+class Delta:
+    pass
+
+
+@dataclass(frozen=True)
 class QuerySpec:
     metric: str
     start: int
@@ -36,7 +41,7 @@ class ArithmeticOperation:
     query: QuerySpec
 
 
-Operation = MetricOperation | Predicate | ArithmeticOperation
+Operation = MetricOperation | Predicate | Delta | ArithmeticOperation
 
 _COMPARATORS = {
     ">": lambda left, right: left > right,
@@ -68,6 +73,8 @@ def execute_query(store, query: QuerySpec) -> dict[str, Any]:
     for operation in query.operations[1:]:
         if isinstance(operation, Predicate):
             series = _apply_predicate(series, operation)
+        elif isinstance(operation, Delta):
+            series = _apply_delta(series)
         elif isinstance(operation, ArithmeticOperation):
             other = execute_query(store, operation.query)
             if query.start != operation.query.start or query.end != operation.query.end:
@@ -116,6 +123,22 @@ def _apply_predicate(series: list[dict[str, Any]], predicate: Predicate) -> list
         }
         for item in series
     ]
+
+
+def _apply_delta(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace each signal with adjacent-sample differences; each output uses the newer timestamp."""
+    result = []
+    for item in series:
+        points = sorted(item["points"], key=lambda point: point["timestamp"])
+        deltas = [
+            {
+                "timestamp": current["timestamp"],
+                "value": float(current["value"]) - float(previous["value"]),
+            }
+            for previous, current in zip(points, points[1:])
+        ]
+        result.append({"dimensions": item["dimensions"], "points": deltas})
+    return result
 
 
 def _apply_arithmetic(

@@ -39,11 +39,18 @@ class MetricsStoreTests(unittest.TestCase):
         self.assertEqual(len(result["series"][0]["points"]), 2)
         self.assertEqual([point["value"] for point in result["series"][0]["points"]], [4.5, 4.5])
 
-    def test_counter_series_writes_zero_for_a_registered_empty_interval(self):
+    def test_counter_query_returns_zero_for_empty_interval_without_storing_it(self):
         now = MetricsStore._bucket_start()
         self.store.add_counter("application.requests", 2)
         self.store.flush(now=now)
         self.store.flush(now=now + 5)
+
+        with self.store.database.read() as db:
+            rows = db.execute(
+                "SELECT bucket_start,sum_value FROM metrics_points WHERE metric_name=? AND point_kind='counter'",
+                ("application.requests",),
+            ).fetchall()
+        self.assertEqual([(row["bucket_start"], row["sum_value"]) for row in rows], [(now, 2)])
 
         result = self.store.query("application.requests", now, now + 10, interval_seconds=5)
         self.assertEqual([point["value"] for point in result["series"][0]["points"]], [2, 0])
