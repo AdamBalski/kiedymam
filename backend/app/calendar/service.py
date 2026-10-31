@@ -8,12 +8,13 @@ from threading import Lock
 from time import monotonic, time
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from google.auth.exceptions import RefreshError
 
 from app.calendar import gcal
 from app.calendar.reconcile import reconcile_integration
-from app.calendar.parsers.registry import PARSER_CACHE_VERSION
-from app.calendar.source import download_and_hash, parse_downloaded_source
+from app.calendar.parsers.registry import parser_cache_version
+from app.calendar.source import download_and_hash, download_latest_revision, parse_downloaded_source
 from app.crypto.envelope import EnvelopeCrypto
 from app.db.repository import Repository
 from app.jobs.queue import QueueFullError
@@ -21,13 +22,21 @@ from app.limits.work import WorkLimits
 
 LOG = logging.getLogger(__name__)
 CACHE_MAX_AGE = timedelta(hours=12)
+CACHE_MISSING_MAX_AGE = timedelta(minutes=30)
 
 
 def _cache_fresh(cache: dict | None) -> bool:
     if not cache:
         return False
     fetched_at = datetime.fromisoformat(cache["fetched_at"])
-    return datetime.now(timezone.utc) - fetched_at.astimezone(timezone.utc) < CACHE_MAX_AGE
+    max_age = CACHE_MISSING_MAX_AGE if cache.get("availability") == "missing" else CACHE_MAX_AGE
+    return datetime.now(timezone.utc) - fetched_at.astimezone(timezone.utc) < max_age
+
+
+def _raise_cached_missing(source_url: str, status: int) -> None:
+    request = httpx.Request("GET", source_url)
+    response = httpx.Response(status, request=request)
+    raise httpx.HTTPStatusError(f"Cached UMB workbook response was HTTP {status}", request=request, response=response)
 
 
 class CalendarService:
@@ -120,19 +129,34 @@ class CalendarService:
 
     async def get_source(self, source_url: str, suppress_integration_id: str | None = None) -> dict:
         cache = self.repository.get_source_cache(source_url)
+        link_key = self.repository.timetable_plan_key_for_url(source_url)
+        plan = self.repository.timetable_plan_by_key(link_key) if link_key else None
+        # A catalog listing can return after a plan was marked missing, but only
+        # a successful workbook fetch proves recovery. Bypass a good cached copy
+        # once so the actual XLSX endpoint can confirm availability.
+        verify_availability = bool(plan and plan.get("availability") == "missing")
         if _cache_fresh(cache):
-            if self.metrics:
-                self.metrics.add_counter("xlsx.cache.access", attributes={"outcome": "hit", "xlsx.url": self._metric_url(source_url)})
-                fetched = datetime.fromisoformat(cache["fetched_at"]).timestamp()
-                self.metrics.set_gauge("xlsx.source.cache.age", max(0, time() - fetched), {"xlsx.url": self._metric_url(source_url)})
-            return cache["parsed"]
+            if cache.get("availability") == "missing":
+                _raise_cached_missing(source_url, int(cache.get("http_status") or 404))
+            if not verify_availability:
+                if self.metrics:
+                    self.metrics.add_counter("xlsx.cache.access", attributes={"outcome": "hit", "xlsx.url": self._metric_url(source_url)})
+                    fetched = datetime.fromisoformat(cache["fetched_at"]).timestamp()
+                    self.metrics.set_gauge("xlsx.source.cache.age", max(0, time() - fetched), {"xlsx.url": self._metric_url(source_url)})
+                return cache["parsed"]
         if self.metrics:
             self.metrics.add_counter("xlsx.cache.access", attributes={"outcome": "miss", "xlsx.url": self._metric_url(source_url)})
         lock = await self._source_lock(source_url)
         async with lock:
             cache = self.repository.get_source_cache(source_url)
+            link_key = self.repository.timetable_plan_key_for_url(source_url)
+            plan = self.repository.timetable_plan_by_key(link_key) if link_key else None
+            verify_availability = bool(plan and plan.get("availability") == "missing")
             if _cache_fresh(cache):
-                return cache["parsed"]
+                if cache.get("availability") == "missing":
+                    _raise_cached_missing(source_url, int(cache.get("http_status") or 404))
+                if not verify_availability:
+                    return cache["parsed"]
             await self._refresh_source_locked(
                 source_url, None, "integration_changed" if suppress_integration_id else "scheduled",
                 {suppress_integration_id} if suppress_integration_id else None,
@@ -168,25 +192,65 @@ class CalendarService:
         async with self.work_limits.umb_downloads:
             await self.work_limits.wait_for_umb_slot()
             download_started = monotonic()
+            link_key = self.repository.timetable_plan_key_for_url(source_url)
+            candidates = self.repository.timetable_revisions_by_key(link_key) if link_key else []
+            effective_url = source_url
             try:
-                digest, contents = await download_and_hash(source_url)
+                if len(candidates) > 1:
+                    effective_url, last_modified, digest, contents = await download_latest_revision(
+                        candidates,
+                        on_probe=lambda revisions: self.repository.update_timetable_revision_dates(
+                            link_key, revisions
+                        ),
+                        downloader=download_and_hash,
+                    )
+                    self.repository.select_timetable_revision(link_key, effective_url, last_modified)
+                else:
+                    digest, contents = await download_and_hash(source_url)
             except Exception as error:
                 attributes = {"outcome": "failure", "xlsx.url": self._metric_url(source_url)}
                 status = getattr(getattr(error, "response", None), "status_code", None)
+                if status in (404, 410):
+                    self.repository.cache_missing_source(source_url, status)
+                    link_key = self.repository.timetable_plan_key_for_url(source_url)
+                    if self.metrics:
+                        self.metrics.add_counter("umb.timetable.plan.unavailable.count", attributes={
+                            "parser.key": self.repository.timetable_parser_key(source_url) or "unknown",
+                            "outcome": "xlsx_not_found",
+                        })
+                    if link_key:
+                        notices = self.repository.set_timetable_plan_availability(
+                            link_key, False, expected_url=source_url
+                        )
+                        self.publish_notifications(notices)
                 if isinstance(status, int):
                     attributes["http.response.status_code"] = status
                 if self.metrics:
                     self.metrics.observe("xlsx.download.duration", monotonic() - download_started, attributes)
                 raise
             download_duration = monotonic() - download_started
+            if link_key:
+                notices = self.repository.set_timetable_plan_availability(
+                    link_key, True, expected_url=effective_url
+                )
+                self.publish_notifications(notices)
             if self.metrics:
-                attributes = {"outcome": "success", "xlsx.url": self._metric_url(source_url)}
-                self.metrics.add_counter("xlsx.download.bytes", len(contents), {"xlsx.url": self._metric_url(source_url)})
+                attributes = {"outcome": "success", "xlsx.url": self._metric_url(effective_url)}
+                self.metrics.add_counter("xlsx.download.bytes", len(contents), {"xlsx.url": self._metric_url(effective_url)})
                 self.metrics.observe("xlsx.download.duration", download_duration, attributes)
+        source_url = effective_url
         cache = self.repository.get_source_cache(source_url)
         integrations = self.repository.integrations_for_source(source_url)
+        parser_key = self.repository.timetable_parser_key(source_url)
+        if not parser_key:
+            raise RuntimeError("No parser key is assigned to this timetable link")
         same_source = bool(cache and cache["content_sha256"] == digest)
-        same_parser = bool(cache and cache["parsed"].get("_parser_version") == PARSER_CACHE_VERSION)
+        current_parser_version = parser_cache_version()
+        same_parser = bool(
+            cache
+            and cache["parsed"].get("_parser_version") == current_parser_version
+            and cache["parsed"].get("_parser_key") == parser_key
+        )
 
         if same_source and same_parser:
             if self.metrics:
@@ -200,7 +264,7 @@ class CalendarService:
 
         parse_started = monotonic()
 
-        def record_parser_result(attempts: int, fallback: bool, parser_id: str | None) -> None:
+        def record_parser_result(parser_id: str | None) -> None:
             if not self.metrics:
                 return
             attributes = {
@@ -209,13 +273,13 @@ class CalendarService:
             }
             if parser_id is not None:
                 attributes["parser.id"] = parser_id
-            self.metrics.add_counter("xlsx.parser.attempt.count", attempts, attributes)
-            if fallback:
-                self.metrics.add_counter("xlsx.parser.fallback.count", attributes=attributes)
+            self.metrics.add_counter("xlsx.parser.attempt.count", 1, attributes)
 
         try:
             async with self.work_limits.xlsx_parses:
-                parsed = await parse_downloaded_source(contents, source_url, record_parser_result)
+                parsed = await parse_downloaded_source(
+                    contents, source_url, record_parser_result, parser_key=parser_key
+                )
         except Exception:
             if self.metrics:
                 self.metrics.observe("xlsx.parse.duration", monotonic() - parse_started,
@@ -226,7 +290,8 @@ class CalendarService:
             attributes = {"parser.id": parser_id, "outcome": "success", "xlsx.url": self._metric_url(source_url)}
             self.metrics.add_counter("xlsx.event.count", len(parsed.get("events", [])), {"parser.id": parser_id, "xlsx.url": self._metric_url(source_url)})
             self.metrics.observe("xlsx.parse.duration", monotonic() - parse_started, attributes)
-        parsed["_parser_version"] = PARSER_CACHE_VERSION
+        parsed["_parser_version"] = current_parser_version
+        parsed["_parser_key"] = parser_key
         parser_changed = bool(cache and not same_parser)
         source_changed = bool(cache and not same_source)
         if self.metrics:

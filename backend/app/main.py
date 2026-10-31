@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
     push_service = await asyncio.to_thread(PushService, repository, crypto, settings, metrics)
     work_limits = WorkLimits()
     calendar_service = CalendarService(repository, crypto, push_service, work_limits, metrics)
-    timetable_catalog = TimetableCatalog(repository, settings.timetable_directory_pages)
+    timetable_catalog = TimetableCatalog(repository, calendar_service.publish_notifications, metrics)
     job_queue = InMemoryJobQueue(
         build_job_handlers(repository, calendar_service),
         workers=4, max_pending=512, metrics=metrics,
@@ -91,6 +91,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        timetable_catalog.stop()
         scheduler.shutdown(wait=False)
         await job_queue.stop()
         metrics_task.cancel()

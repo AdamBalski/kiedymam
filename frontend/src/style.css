@@ -121,7 +121,6 @@ li { margin: .35em 0; }
 .metric-table th, .metric-table td { padding: .45em; border: 1px solid #aaa; text-align: left; white-space: nowrap; }
 .metric-table th { background: #eee; }
 .admin-push-form { max-width: 650px; }
-
 @media (max-width: 560px) {
   body { padding: 14px; font-size: 16px; }
   h1 { font-size: 2em; }

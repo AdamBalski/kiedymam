@@ -10,6 +10,7 @@ from app.calendar.service import CalendarService
 from app.calendar.parsers.registry import PARSER_CACHE_VERSION
 from app.db.database import Database
 from app.db.repository import Repository
+from app.calendar.link_identity import timetable_link_key
 
 
 class CalendarServiceTests(unittest.TestCase):
@@ -23,9 +24,19 @@ class CalendarServiceTests(unittest.TestCase):
                 ("user-1", "google-1", "student@example.edu", "Student", "2026-10-23T10:00:00+00:00"),
             )
         self.repository = Repository(database)
+        source_url = "https://www.umb.edu.pl/schedule.xlsx"
+        self.link_key = timetable_link_key("https://www.umb.edu.pl/plany", "Schedule", source_url)
+        with database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO timetable_links(
+                       url,name,programme,page_url,parser_key,link_key,discovered_at,last_seen_at,active
+                   ) VALUES(?,?,?,?,?,?,?,?,1)""",
+                (source_url, "Schedule", "Programme", "https://www.umb.edu.pl/plany", "G0",
+                 self.link_key, "2026-10-23T10:00:00+00:00", "2026-10-23T10:00:00+00:00"),
+            )
         self.integration = self.repository.create_integration(
             user_id="user-1",
-            source_url="https://www.umb.edu.pl/schedule.xlsx",
+            timetable_link_key=self.link_key,
             group_number=1,
             calendar_id="calendar-1",
             calendar_name="UMB Fizjoterapia — grupa 6 nr 1",
@@ -43,7 +54,7 @@ class CalendarServiceTests(unittest.TestCase):
         self.assertIsNone(self.repository.get_integration(self.integration["id"], "user-1"))
 
     def test_unchanged_fresh_source_reuses_parsed_cache_without_parsing_or_reconciling(self):
-        parsed = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION}
+        parsed = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION, "_parser_key": "G0"}
         self.repository.upsert_source_cache(self.integration["source_url"], "same-sha", parsed)
         self.repository.mark_reconciled(self.integration["id"], "same-sha")
 
@@ -65,7 +76,7 @@ class CalendarServiceTests(unittest.TestCase):
         asyncio.run(exercise())
 
     def test_manual_sync_with_unchanged_sha_does_not_reconcile(self):
-        parsed = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION}
+        parsed = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION, "_parser_key": "G0"}
         self.repository.upsert_source_cache(self.integration["source_url"], "same-sha", parsed)
         self.repository.mark_reconciled(self.integration["id"], "same-sha")
 
@@ -87,7 +98,7 @@ class CalendarServiceTests(unittest.TestCase):
         asyncio.run(exercise())
 
     def test_changed_source_is_parsed_and_reconciled(self):
-        cached = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION}
+        cached = {"events": [], "changelog": [], "_parser_version": PARSER_CACHE_VERSION, "_parser_key": "G0"}
         self.repository.upsert_source_cache(self.integration["source_url"], "old-sha", cached)
         parsed = {"events": [{"event_key": "new"}], "changelog": []}
 
@@ -105,7 +116,8 @@ class CalendarServiceTests(unittest.TestCase):
             ):
                 result = await self.service.refresh_source(self.integration["source_url"])
 
-            self.assertEqual(result, (True, True, {**parsed, "_parser_version": PARSER_CACHE_VERSION}))
+            self.assertEqual(result, (True, True, {**parsed, "_parser_version": PARSER_CACHE_VERSION,
+                                                  "_parser_key": "G0"}))
             parse.assert_awaited_once()
             reconcile.assert_called_once()
             cache = self.repository.get_source_cache(self.integration["source_url"])
@@ -121,7 +133,7 @@ class CalendarServiceTests(unittest.TestCase):
                 ("user-2", "google-2", "other@example.edu", "Other", "2026-10-23T10:00:00+00:00"),
             )
         other = self.repository.create_integration(
-            user_id="user-2", source_url=self.integration["source_url"], group_number=2,
+            user_id="user-2", timetable_link_key=self.link_key, group_number=2,
             calendar_id="calendar-2", calendar_name="Other plan",
         )
         calls = []
@@ -151,7 +163,7 @@ class CalendarServiceTests(unittest.TestCase):
                 ("user-2", "google-2", "other@example.edu", "Other", "2026-10-23T10:00:00+00:00"),
             )
         other = self.repository.create_integration(
-            user_id="user-2", source_url=self.integration["source_url"], group_number=2,
+            user_id="user-2", timetable_link_key=self.link_key, group_number=2,
             calendar_id="calendar-2", calendar_name="Other plan",
         )
         calls = []

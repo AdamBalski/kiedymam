@@ -8,6 +8,7 @@ import os
 from pathlib import PurePosixPath
 import random
 import re
+import tempfile
 import time
 import unittest
 from urllib.parse import unquote, urljoin, urlsplit
@@ -15,8 +16,11 @@ from urllib.parse import unquote, urljoin, urlsplit
 import httpx
 
 from app.calendar.parser import ScheduleParseError
-from app.calendar.parsers.registry import FALLBACK_FORMATS, format_for_url, parse_workbook_for_url
+from app.calendar.parser_assignment import parser_key_for_url
+from app.calendar.parsers.registry import PARSER_KEYS, parse_workbook_for_url
 from app.calendar.source import _download
+from app.db.database import Database
+from app.db.repository import Repository
 
 
 SCHEDULE_PAGES = (
@@ -72,6 +76,11 @@ class WorkbookLinks(HTMLParser):
 
 
 def _schedule_links() -> list[PublishedWorkbook]:
+    with tempfile.TemporaryDirectory() as tempdir:
+        database = Database(os.path.join(tempdir, "schedule-test.sqlite3"))
+        database.initialize()
+        matchers = Repository(database).timetable_configuration()["matchers"]
+
     discovered: dict[str, PublishedWorkbook] = {}
     for programme, page_url in SCHEDULE_PAGES:
         response = httpx.get(
@@ -96,22 +105,26 @@ def _schedule_links() -> list[PublishedWorkbook]:
                 or ROSTER_FILE.search(filename)
             ):
                 continue
-            discovered.setdefault(url, PublishedWorkbook(programme, url, format_for_url(url)))
+            discovered.setdefault(
+                url,
+                PublishedWorkbook(
+                    programme,
+                    url,
+                    parser_key_for_url(url, matchers),
+                ),
+            )
         time.sleep(float(os.getenv("UMB_SYSTEM_TEST_PAGE_INTERVAL_SECONDS", "1")))
     return list(discovered.values())
 
 
 def _stratified_sample(candidates: list[PublishedWorkbook], rng: random.Random) -> list[PublishedWorkbook]:
-    by_format = {format_id: [] for format_id in FALLBACK_FORMATS}
-    unmatched: list[PublishedWorkbook] = []
+    by_format = {format_id: [] for format_id in PARSER_KEYS}
     for item in candidates:
         if item.format_id in by_format:
             by_format[item.format_id].append(item)
-        else:
-            unmatched.append(item)
 
     selected: list[PublishedWorkbook] = []
-    for format_id in FALLBACK_FORMATS:
+    for format_id in PARSER_KEYS:
         pool = by_format[format_id]
         rng.shuffle(pool)
         if len(pool) < FAMILY_SAMPLE_SIZE:
@@ -119,7 +132,10 @@ def _stratified_sample(candidates: list[PublishedWorkbook], rng: random.Random) 
         selected.extend(pool[:FAMILY_SAMPLE_SIZE])
 
     selected_urls = {item.url for item in selected}
-    remaining = [item for item in candidates if item.url not in selected_urls]
+    remaining = [
+        item for item in candidates
+        if item.url not in selected_urls and item.format_id in by_format
+    ]
     rng.shuffle(remaining)
     selected.extend(remaining[: TOTAL_SAMPLE_SIZE - len(selected)])
     return selected
@@ -151,10 +167,13 @@ class PublishedScheduleSystemTests(unittest.TestCase):
         rng = random.Random(seed)
         sample = _stratified_sample(candidates, rng)
         selected_urls = {item.url for item in sample}
-        remaining = [item for item in candidates if item.url not in selected_urls]
+        remaining = [
+            item for item in candidates
+            if item.url not in selected_urls and item.format_id in PARSER_KEYS
+        ]
         rng.shuffle(remaining)
         successful: list[PublishedWorkbook] = []
-        successful_formats: dict[str, int] = {format_id: 0 for format_id in FALLBACK_FORMATS}
+        successful_formats: dict[str, int] = {format_id: 0 for format_id in PARSER_KEYS}
         interval = float(os.getenv("UMB_SYSTEM_TEST_WORKBOOK_INTERVAL_SECONDS", "16"))
         last_request_at: float | None = None
         attempts = 0
@@ -166,7 +185,7 @@ class PublishedScheduleSystemTests(unittest.TestCase):
                 item = pending.pop(0)
             else:
                 underrepresented = next(
-                    (format_id for format_id in FALLBACK_FORMATS if successful_formats[format_id] < FAMILY_SAMPLE_SIZE),
+                    (format_id for format_id in PARSER_KEYS if successful_formats[format_id] < FAMILY_SAMPLE_SIZE),
                     None,
                 )
                 backup_index = next(
@@ -202,7 +221,7 @@ class PublishedScheduleSystemTests(unittest.TestCase):
 
             self.assertTrue(contents.startswith(b"PK\x03\x04"), f"Not an XLSX workbook: {item.url}")
             try:
-                result = parse_workbook_for_url(contents, item.url)
+                result = parse_workbook_for_url(contents, item.url, parser_key=item.format_id)
             except ScheduleParseError as exc:
                 self.fail(f"No registered parser accepted {item.url}: {exc}")
             _assert_plan_events(self, result, item.url)
@@ -216,7 +235,7 @@ class PublishedScheduleSystemTests(unittest.TestCase):
             f"Only {len(successful)} valid plans parsed in {attempts} attempts; "
             f"selected {[(item.format_id, item.url) for item in sample]}",
         )
-        self.assertTrue(all(successful_formats[format_id] >= FAMILY_SAMPLE_SIZE for format_id in FALLBACK_FORMATS))
+        self.assertTrue(all(successful_formats[format_id] >= FAMILY_SAMPLE_SIZE for format_id in PARSER_KEYS))
 
 
 if __name__ == "__main__":

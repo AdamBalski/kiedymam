@@ -28,6 +28,8 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(versions, list(range(1, len(Database._load_migrations()) + 1)))
         self.assertIn("users", tables)
         self.assertIn("timetable_links", tables)
+        self.assertIn("timetable_directory_pages", tables)
+        self.assertIn("timetable_link_matchers", tables)
         self.assertIn("push_subscriptions", tables)
         self.assertIn("user_feedback", tables)
         for removed_table in (
@@ -39,6 +41,23 @@ class MigrationTests(unittest.TestCase):
         with self.database.read() as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(push_subscriptions)")}
         self.assertIn("device_name", columns)
+        with self.database.read() as db:
+            integration_columns = {row[1] for row in db.execute("PRAGMA table_info(integrations)")}
+            timetable_link_columns = {row[1] for row in db.execute("PRAGMA table_info(timetable_links)")}
+        self.assertIn("timetable_link_key", integration_columns)
+        self.assertNotIn("source_url", integration_columns)
+        self.assertIn("link_key", timetable_link_columns)
+        self.assertIn("name", timetable_link_columns)
+        self.assertIn("parser_key", timetable_link_columns)
+        self.assertNotIn("href_label", timetable_link_columns)
+        with self.database.read() as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertNotIn("parser_url_patterns", tables)
+        with self.database.read() as db:
+            matchers = db.execute(
+                "SELECT COUNT(*) FROM timetable_link_matchers"
+            ).fetchone()[0]
+        self.assertGreater(matchers, 0)
 
     def test_upgrades_a_database_created_with_the_previous_schema(self):
         first_migration = Database._load_migrations()[0]

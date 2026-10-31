@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app.calendar.reconcile import reconcile_integration
 from app.db.database import Database
 from app.db.repository import Repository
+from app.calendar.link_identity import timetable_link_key
 
 
 class FakeRequest:
@@ -80,9 +81,19 @@ class ReconciliationTests(unittest.TestCase):
                 ("user-1", "google-1", "student@example.edu", "Student", "2026-10-23T10:00:00+00:00"),
             )
         self.repository = Repository(database)
+        source_url = "https://www.umb.edu.pl/schedule.xlsx"
+        link_key = timetable_link_key("https://www.umb.edu.pl/plany", "Schedule", source_url)
+        with database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO timetable_links(
+                       url,name,programme,page_url,parser_key,link_key,discovered_at,last_seen_at,active
+                   ) VALUES(?,?,?,?,?,?,?,?,1)""",
+                (source_url, "Schedule", "Programme", "https://www.umb.edu.pl/plany", "G0",
+                 link_key, "2026-10-23T10:00:00+00:00", "2026-10-23T10:00:00+00:00"),
+            )
         self.integration = self.repository.create_integration(
             user_id="user-1",
-            source_url="https://www.umb.edu.pl/schedule.xlsx",
+            timetable_link_key=link_key,
             group_number=1,
             calendar_id="calendar-1",
             calendar_name="UMB Fizjoterapia — grupa 6 nr 1",

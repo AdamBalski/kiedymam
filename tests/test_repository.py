@@ -7,6 +7,7 @@ import unittest
 from app.db.database import Database
 from app.db.repository import Repository
 from app.crypto.envelope import EnvelopeCrypto
+from app.calendar.link_identity import timetable_link_key
 
 
 class RepositoryTests(unittest.TestCase):
@@ -20,9 +21,19 @@ class RepositoryTests(unittest.TestCase):
                 ("user-1", "google-1", "student@example.edu", "Student", "2026-10-23T10:00:00+00:00"),
             )
         self.repository = Repository(self.database)
+        self.source_url = "https://www.umb.edu.pl/schedule.xlsx"
+        self.link_key = timetable_link_key("https://www.umb.edu.pl/plany", "Schedule", self.source_url)
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO timetable_links(
+                       url,name,programme,page_url,parser_key,link_key,discovered_at,last_seen_at,active
+                   ) VALUES(?,?,?,?,?,?,?,?,1)""",
+                (self.source_url, "Schedule", "Programme", "https://www.umb.edu.pl/plany", "G0",
+                 self.link_key, "2026-10-23T10:00:00+00:00", "2026-10-23T10:00:00+00:00"),
+            )
         self.integration = self.repository.create_integration(
             user_id="user-1",
-            source_url="https://www.umb.edu.pl/schedule.xlsx",
+            timetable_link_key=self.link_key,
             group_number=1,
             calendar_id="calendar-1",
             calendar_name="KiedyMam — grupa 1",
@@ -35,7 +46,7 @@ class RepositoryTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.repository.create_integration(
                 user_id="user-1",
-                source_url="https://www.umb.edu.pl/another.xlsx",
+                timetable_link_key=self.link_key,
                 group_number=2,
                 calendar_id="calendar-2",
                 calendar_name="second calendar",

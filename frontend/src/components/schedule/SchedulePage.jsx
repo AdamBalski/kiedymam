@@ -12,7 +12,7 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
   useEffect(() => {
     setGroupNumber(String(integration.group_number));
     setCalendarName(integration.calendar_name || "");
-    api.workbookInfo(integration.source_url).then(setWorkbook).catch((error) => setError(error.message));
+    api.workbookInfo(integration.timetable_link_key).then(setWorkbook).catch((error) => setError(error.message));
   }, [integration.id, integration.group_number]);
 
   async function updateGroup(event) {
@@ -83,7 +83,9 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
       <h2>Twój kalendarz</h2>
       <p><strong>{integration.calendar_name}</strong></p>
       <p><a href={`https://calendar.google.com/calendar/u/0/r?cid=${encodeURIComponent(integration.calendar_id)}`} target="_blank" rel="noreferrer">Otwórz kalendarz Google</a></p>
-      <p>Źródło: <a href={integration.source_url} target="_blank" rel="noreferrer">arkusz UMB</a></p>
+      <p>Źródło: {integration.source_url
+        ? <a href={integration.source_url} target="_blank" rel="noreferrer">aktualny arkusz UMB</a>
+        : "plan jest chwilowo niedostępny w katalogu UMB"}</p>
       <p>Ostatnia synchronizacja: {dateTime(integration.last_sync_at)}</p>
 
       <div className="button-row">
@@ -93,8 +95,8 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
 
       <hr />
       <h3>Ustawienia kalendarza</h3>
-      <p className="muted">Link do arkusza pozostaje stały. Aby użyć innego planu, usuń integrację i utwórz ją ponownie.</p>
-      <form onSubmit={updateGroup} className="inline-form">
+      <p className="muted">Kalendarz śledzi wybrany plan i korzysta z jego aktualnego linku w katalogu UMB. Aby wybrać inny plan, usuń integrację i utwórz ją ponownie.</p>
+      {!workbook?.available && workbook ? <p role="status" className="muted">{workbook.message || "Ten plan nie jest obecnie dostępny na stronie UMB."}</p> : <form onSubmit={updateGroup} className="inline-form">
         {workbook?.grouping_mode === "groups" ? <>
           <label htmlFor="change-group">Twoja grupa</label>
           <select id="change-group" value={groupNumber} onChange={(event) => setGroupNumber(event.target.value)} required>
@@ -107,7 +109,7 @@ export default function SchedulePage({ integration, onChanged, setError, setSucc
         <label htmlFor="change-calendar-name">Nazwa kalendarza</label>
         <input id="change-calendar-name" type="text" maxLength="100" value={calendarName} onChange={(event) => setCalendarName(event.target.value)} required />
         <button type="submit" disabled={saving}>{saving ? "Zapisywanie…" : "Zapisz ustawienia"}</button>
-      </form>
+      </form>}
     </section>
   );
 }

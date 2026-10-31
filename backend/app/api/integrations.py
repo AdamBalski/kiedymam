@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 
 from app.api.auth import current_user, require_csrf
 from app.calendar import gcal
-from app.calendar.source import canonicalize_xlsx_url
 from app.calendar.service import CalendarService
 from app.db.repository import Repository
 from app.jobs.queue import QueueFullError
@@ -19,7 +18,7 @@ router = APIRouter(prefix="/api/integrations", tags=["integrations"])
 
 
 class IntegrationRequest(BaseModel):
-    source_url: str = Field(min_length=8, max_length=2048)
+    timetable_link_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
     group_number: int = Field(ge=0, le=999)
     calendar_name: str | None = Field(default=None, min_length=1, max_length=100)
 
@@ -37,6 +36,7 @@ def _public(integration: dict) -> dict:
     return {
         "id": integration["id"],
         "source_url": integration["source_url"],
+        "timetable_link_key": integration["timetable_link_key"],
         "group_number": int(integration["group_number"]),
         "calendar_name": integration["calendar_name"],
         "calendar_id": integration["calendar_id"],
@@ -90,14 +90,26 @@ def _validate_group_choice(parsed: dict, group_number: int) -> None:
 @router.get("/workbook-info")
 async def workbook_info(
     request: Request,
-    source_url: str = Query(min_length=8, max_length=2048),
+    timetable_link_key: str = Query(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"),
     user: dict = Depends(current_user),
 ) -> dict:
     repository, calendar_service = _services(request)
-    try:
-        canonical_url = canonicalize_xlsx_url(source_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    timetable_link = repository.active_timetable_link_by_key(timetable_link_key)
+    if not timetable_link:
+        plan = repository.timetable_plan_by_key(timetable_link_key)
+        if not plan:
+            raise HTTPException(status_code=404, detail="Unknown timetable plan.")
+        return {
+            "available": False,
+            "timetable_link_key": timetable_link_key,
+            "degree": plan["degree"],
+            "study_year": plan["study_year"],
+            "study_mode": plan["study_mode"],
+            "grouping_mode": "unavailable",
+            "available_groups": [],
+            "message": "Ten plan nie jest obecnie dostępny w katalogu UMB.",
+        }
+    canonical_url = timetable_link["url"]
     accepted, retry_at = repository.reserve_workbook_inspection(user["id"], canonical_url)
     if not accepted:
         retry_seconds = max(1, ceil((retry_at or 0) - time.time()))
@@ -108,14 +120,33 @@ async def workbook_info(
         )
     try:
         parsed = await calendar_service.get_source(canonical_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", getattr(exc, "status_code", None))
+        if status in (404, 410):
+            plan = repository.timetable_plan_by_key(timetable_link_key)
+            notices = repository.set_timetable_plan_availability(
+                timetable_link_key, False, expected_url=canonical_url
+            )
+            calendar_service.publish_notifications(notices)
+            return {
+                "available": False,
+                "timetable_link_key": timetable_link_key,
+                "degree": plan["degree"] if plan else timetable_link["degree"],
+                "study_year": plan["study_year"] if plan else timetable_link["study_year"],
+                "study_mode": plan["study_mode"] if plan else timetable_link["study_mode"],
+                "grouping_mode": "unavailable",
+                "available_groups": [],
+                "message": "Ten plan nie jest obecnie dostępny na stronie UMB.",
+            }
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         LOG.exception("Could not inspect UMB schedule workbook")
         raise HTTPException(status_code=502, detail="Could not read this UMB schedule workbook") from exc
     return {
+        "available": True,
         "source_url": canonical_url,
-        "format_id": parsed.get("format_id"),
+        "timetable_link_key": timetable_link_key,
+        "parser_key": parsed.get("format_id"),
         "grouping_mode": parsed.get("grouping_mode", "unknown"),
         "available_groups": parsed.get("available_groups", []),
     }
@@ -129,8 +160,16 @@ async def create_integration(payload: IntegrationRequest, request: Request, user
     if repository.list_integrations(user["id"]):
         raise HTTPException(status_code=409, detail="This Google account already has an integration. Delete it before setting up another.")
     try:
-        source_url = canonicalize_xlsx_url(payload.source_url)
+        timetable_link = repository.active_timetable_link_by_key(payload.timetable_link_key)
+        if not timetable_link:
+            raise HTTPException(
+                status_code=422,
+                detail="Choose an available plan from the list.",
+            )
+        source_url = timetable_link["url"]
         parsed = await calendar_service.get_source(source_url)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -150,8 +189,8 @@ async def create_integration(payload: IntegrationRequest, request: Request, user
 
     try:
         integration = repository.create_integration(
-            user_id=user["id"], source_url=source_url, group_number=payload.group_number,
-            calendar_id=calendar_id, calendar_name=calendar_name,
+            user_id=user["id"], timetable_link_key=payload.timetable_link_key,
+            group_number=payload.group_number, calendar_id=calendar_id, calendar_name=calendar_name,
         )
     except sqlite3.IntegrityError as exc:
         await _delete_unclaimed_calendar(user["id"], calendar_id, request, repository)
@@ -203,6 +242,8 @@ async def update_integration(integration_id: str, payload: GroupUpdate, request:
         notice = repository.create_sync_completion_notification(integration, "integration_changed")
         calendar_service.publish_notifications([notice])
         return _public(integration)
+    if not existing.get("source_url"):
+        raise HTTPException(status_code=409, detail="This plan is temporarily unavailable in the UMB catalogue.")
     try:
         parsed = await calendar_service.get_source(
             existing["source_url"], suppress_integration_id=integration_id
@@ -244,6 +285,8 @@ async def sync_now(integration_id: str, request: Request, response: Response,
     integration = repository.get_integration(integration_id, user["id"])
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
+    if not integration.get("source_url"):
+        raise HTTPException(status_code=409, detail="This plan is temporarily unavailable in the UMB catalogue.")
     accepted, eligible_at = repository.reserve_manual_sync(integration_id, user["id"])
     if not accepted:
         if eligible_at is None:

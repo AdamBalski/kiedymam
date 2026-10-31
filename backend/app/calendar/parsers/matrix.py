@@ -120,7 +120,7 @@ def _matrix_date_rows(sheet, format_id: str) -> list[tuple[int, list[tuple[int, 
             _weekday(sheet.cell(row_number, col).value)
             for col in range(1, max_column + 1)
         )
-        marker = any(
+        has_termin_marker = any(
             "termin" in _fold(str(sheet.cell(row_number, col).value or "")).casefold()
             for col in range(1, max_column + 1)
         )
@@ -133,7 +133,7 @@ def _matrix_date_rows(sheet, format_id: str) -> list[tuple[int, list[tuple[int, 
         if format_id == "M1":
             if (preceding_weekday or current_weekday) and group_heading:
                 candidates.append((row_number, headers))
-        elif group_heading and (preceding_weekday or "termin" in marker):
+        elif group_heading and (preceding_weekday or has_termin_marker):
             candidates.append((row_number, headers))
     return candidates
 

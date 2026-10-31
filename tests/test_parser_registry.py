@@ -1,10 +1,8 @@
-from __future__ import annotations
-
-import re
 import unittest
 from unittest.mock import patch
 
 from app.calendar.parser import ScheduleParseError
+from app.calendar.parser_assignment import parser_key_for_url
 from app.calendar.parsers import registry
 from app.calendar.reconcile import _applies_to_group
 
@@ -23,68 +21,34 @@ class StubParser:
         return self.result
 
 
-def registrations(*parsers: StubParser) -> dict:
-    return {
-        parser.format_id: registry.ParserRegistration(parser, ())
-        for parser in parsers
-    }
-
-
 class ParserRegistryTests(unittest.TestCase):
-    def setUp(self):
-        self.memory = patch.object(registry, "_remembered_parsers", registry.OrderedDict())
-        self.memory.start()
-        self.addCleanup(self.memory.stop)
-
-    def test_unmatched_url_tries_registered_parsers_in_order_until_one_succeeds(self):
-        g0 = StubParser("G0", error=ScheduleParseError("not G0"))
+    def test_parser_key_dispatches_to_exactly_one_parser(self):
+        g0 = StubParser("G0", error=ValueError("wrong workbook shape"))
         g1 = StubParser("G1", {"format": "G1"})
-        m1 = StubParser("M1", {"format": "M1"})
-        registrations_for_test = registrations(g0, g1, m1)
+        with patch.dict(registry.PARSER_REGISTRY, {"G0": g0, "G1": g1}, clear=True):
+            with self.assertRaisesRegex(ScheduleParseError, "Parser G0 rejected"):
+                registry.parse_workbook_for_url(
+                    b"workbook", "https://umb.edu.pl/schedule.xlsx", parser_key="G0"
+                )
 
-        with (
-            patch.dict(registry.PARSER_REGISTRY, registrations_for_test, clear=True),
-            patch.object(registry, "FALLBACK_FORMATS", ("G0", "G1", "M1")),
-        ):
-            result = registry.parse_workbook_for_url(b"workbook", "https://umb.edu.pl/unknown.xlsx")
+        self.assertEqual((g0.calls, g1.calls), (1, 0))
 
-        self.assertEqual(result, {
-            "format": "G1", "format_id": "G1", "available_groups": [], "grouping_mode": "unknown"
-        })
-        self.assertEqual([g0.calls, g1.calls, m1.calls], [1, 1, 0])
-
-    def test_matching_url_parser_runs_first_then_falls_back_and_is_remembered(self):
-        m1 = StubParser("M1", error=ValueError("unexpected workbook shape"))
-        g0 = StubParser("G0", {"format": "G0"})
-        registrations_for_test = registrations(m1, g0)
-        registrations_for_test["M1"] = registry.ParserRegistration(
-            m1, (re.compile(r"/medicine\.xlsx$", re.IGNORECASE),)
+    def test_migration_matcher_assigns_a_single_parser_key(self):
+        matchers = [{"url_glob": "*/[1-5]_fizjoterapia_*.xlsx", "parser_key": "G0"}]
+        self.assertEqual(
+            parser_key_for_url("https://www.umb.edu.pl/plany/3_fizjoterapia_zima_26.27.xlsx", matchers),
+            "G0",
         )
+        self.assertIsNone(parser_key_for_url("https://www.umb.edu.pl/plany/unknown.xlsx", matchers))
 
-        with (
-            patch.dict(registry.PARSER_REGISTRY, registrations_for_test, clear=True),
-            patch.object(registry, "FALLBACK_FORMATS", ("G0", "M1")),
-        ):
-            url = "https://umb.edu.pl/medicine.xlsx"
-            first = registry.parse_workbook_for_url(b"workbook", url)
-            # The cached parser is attempted first on subsequent refreshes.
-            second = registry.parse_workbook_for_url(b"workbook", url)
-
-        expected = {"format": "G0", "format_id": "G0", "available_groups": [], "grouping_mode": "unknown"}
-        self.assertEqual(first, expected)
-        self.assertEqual(second, expected)
-        self.assertEqual(m1.calls, 1)
-        self.assertEqual(g0.calls, 2)
-
-    def test_all_parser_failures_report_each_attempt(self):
-        g0 = StubParser("G0", error=ScheduleParseError("bad grid"))
-        g1 = StubParser("G1", error=ValueError("bad matrix"))
-        with (
-            patch.dict(registry.PARSER_REGISTRY, registrations(g0, g1), clear=True),
-            patch.object(registry, "FALLBACK_FORMATS", ("G0", "G1")),
-        ):
-            with self.assertRaisesRegex(ScheduleParseError, "G0: bad grid; G1: bad matrix"):
-                registry.parse_workbook_for_url(b"workbook", "https://umb.edu.pl/unknown.xlsx")
+    def test_unknown_parser_key_fails_instead_of_trying_other_parsers(self):
+        parser = StubParser("G0", {"format": "G0"})
+        with patch.dict(registry.PARSER_REGISTRY, {"G0": parser}, clear=True):
+            with self.assertRaisesRegex(ScheduleParseError, "No parser key is assigned"):
+                registry.parse_workbook_for_url(
+                    b"workbook", "https://umb.edu.pl/unknown.xlsx", parser_key="missing"
+                )
+        self.assertEqual(parser.calls, 0)
 
     def test_group_metadata_supports_degree_workbooks_with_more_than_36_groups(self):
         parsed = registry._with_group_metadata({

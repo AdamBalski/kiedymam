@@ -37,7 +37,7 @@ export const api = {
   integrations: () => request("/api/integrations"),
   timetableLinks: () => request("/api/timetable-links"),
   createIntegration: (body) => request("/api/integrations", { method: "POST", body }),
-  workbookInfo: (sourceUrl) => request(`/api/integrations/workbook-info?source_url=${encodeURIComponent(sourceUrl)}`),
+  workbookInfo: (timetableLinkKey) => request(`/api/integrations/workbook-info?timetable_link_key=${encodeURIComponent(timetableLinkKey)}`),
   updateGroup: (id, body) => request(`/api/integrations/${encodeURIComponent(id)}`, { method: "PATCH", body }),
   syncNow: (id) => request(`/api/integrations/${encodeURIComponent(id)}/sync`, { method: "POST" }),
   deleteIntegration: (id) => request(`/api/integrations/${encodeURIComponent(id)}`, { method: "DELETE" }),

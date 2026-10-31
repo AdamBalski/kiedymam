@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 import logging
+from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit, urljoin
 
 import httpx
@@ -75,13 +77,90 @@ async def download_and_hash(url: str) -> tuple[str, bytes]:
     return digest, contents
 
 
-async def parse_downloaded_source(contents: bytes, url: str, on_parser_result=None) -> dict:
+async def download_latest_revision(
+    candidates: list[dict], on_probe=None, downloader=download_and_hash
+) -> tuple[str, str | None, str, bytes]:
+    """Probe all listed physical revisions and download the newest available one."""
+    if not candidates:
+        raise ValueError("No listed workbook revisions are available for this timetable plan")
+
+    async def probe(candidate: dict) -> tuple[str, str | None, datetime | None, int | None]:
+        original = canonicalize_xlsx_url(str(candidate["url"]))
+        current = original
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=5), follow_redirects=False) as client:
+            for _ in range(4):
+                response = await client.head(
+                    current,
+                    headers={"User-Agent": "KiedyMam-UMB-Calendar/0.1"},
+                )
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("UMB returned an invalid redirect")
+                    current = canonicalize_xlsx_url(urljoin(current, location))
+                    continue
+                if response.status_code in (404, 410):
+                    return original, None, None, response.status_code
+                response.raise_for_status()
+                raw = response.headers.get("last-modified")
+                if not raw:
+                    return original, None, None, None
+                try:
+                    parsed = parsedate_to_datetime(raw)
+                except (TypeError, ValueError, OverflowError):
+                    LOG.warning("UMB returned an invalid Last-Modified header url=%s", original)
+                    return original, None, None, None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                normalized = parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+                return original, normalized, parsed.astimezone(timezone.utc), None
+        raise ValueError("UMB returned too many redirects")
+
+    probed = await asyncio.gather(*(probe(candidate) for candidate in candidates))
+    if on_probe:
+        on_probe([{"url": item[0], "last_modified": item[1]} for item in probed])
+    available = [item for item in probed if item[3] is None]
+    if not available:
+        status = 410 if any(item[3] == 410 for item in probed) else 404
+        url = probed[0][0]
+        request = httpx.Request("HEAD", url)
+        response = httpx.Response(status, request=request)
+        raise httpx.HTTPStatusError(
+            f"All listed UMB workbook revisions were unavailable (HTTP {status})",
+            request=request,
+            response=response,
+        )
+
+    # Missing Last-Modified values sort below dated releases. The URL tie-break
+    # keeps selection deterministic if UMB serves equal or absent timestamps.
+    ordered = sorted(
+        available,
+        key=lambda item: (item[2] or datetime.min.replace(tzinfo=timezone.utc), item[0]),
+        reverse=True,
+    )
+    last_missing_error = None
+    for selected_url, last_modified, _, _ in ordered:
+        try:
+            digest, contents = await downloader(selected_url)
+            return selected_url, last_modified, digest, contents
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code not in (404, 410):
+                raise
+            last_missing_error = error
+    if last_missing_error:
+        raise last_missing_error
+    raise ValueError("No available UMB workbook revision could be downloaded")
+
+
+async def parse_downloaded_source(contents: bytes, url: str, on_parser_result=None, parser_key: str | None = None) -> dict:
     canonical = canonicalize_xlsx_url(url)
-    return await asyncio.to_thread(parse_workbook_for_url, contents, canonical, on_parser_result)
+    return await asyncio.to_thread(
+        parse_workbook_for_url, contents, canonical, on_parser_result, parser_key=parser_key
+    )
 
 
-async def fetch_and_parse(url: str) -> tuple[str, dict]:
+async def fetch_and_parse(url: str, parser_key: str) -> tuple[str, dict]:
     canonical = canonicalize_xlsx_url(url)
     digest, contents = await download_and_hash(canonical)
-    parsed = await parse_downloaded_source(contents, canonical)
+    parsed = await parse_downloaded_source(contents, canonical, parser_key=parser_key)
     return digest, parsed

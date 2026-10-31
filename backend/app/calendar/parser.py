@@ -334,10 +334,10 @@ def parse_g0_workbook(contents: bytes) -> dict:
     return result
 
 
-def parse_workbook(contents: bytes) -> dict:
+def parse_workbook(contents: bytes, parser_key: str) -> dict:
     from app.calendar.parsers.registry import parse_workbook as parse_registered_workbook
 
-    return parse_registered_workbook(contents)
+    return parse_registered_workbook(contents, parser_key)
 
 
 def parse_workbook_with_format(contents: bytes, format_id: str) -> dict:

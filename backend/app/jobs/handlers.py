@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import email.utils
 import logging
@@ -87,7 +88,7 @@ def build_job_handlers(repository: Repository, calendar_service: CalendarService
                     repository.integrations_for_source(integration["source_url"]), None,
                 )
                 return {"superseded": True, "reason": "source_sha_changed"}
-            result = await __import__("asyncio").to_thread(
+            result = await asyncio.to_thread(
                 calendar_service.reconcile,
                 integration,
                 parsed,
@@ -142,8 +143,9 @@ def build_job_handlers(repository: Repository, calendar_service: CalendarService
                 calendar_service.publish_notifications([notice])
             raise
 
-    return {
+    handlers = {
         "source_refresh": source_refresh,
         "reconcile": reconcile,
         "manual_sync": manual_sync,
     }
+    return handlers

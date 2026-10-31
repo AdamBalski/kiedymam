@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 import uuid
 
+from app.calendar.link_identity import timetable_link_key
 from app.db.database import Database
 
 
@@ -16,12 +17,50 @@ class Repository:
     def __init__(self, database: Database):
         self.database = database
 
+    def timetable_configuration(self) -> dict:
+        with self.database.read() as db:
+            pages = db.execute(
+                "SELECT label,page_url AS url FROM timetable_directory_pages ORDER BY position,page_url"
+            ).fetchall()
+            matchers = db.execute(
+                "SELECT id,url_glob,parser_key,degree,study_year,study_mode,position FROM timetable_link_matchers ORDER BY position,id"
+            ).fetchall()
+        return {
+            "pages": [dict(row) for row in pages],
+            "matchers": [dict(row) for row in matchers],
+        }
+
     def list_integrations(self, user_id: str) -> list[dict]:
         with self.database.read() as db:
             rows = db.execute(
                 "SELECT * FROM integrations WHERE user_id=? ORDER BY created_at", (user_id,)
             ).fetchall()
-        return [dict(row) for row in rows]
+            links_by_key = self._active_links_by_key(db)
+        return self._with_current_source_urls(rows, links_by_key)
+
+    @staticmethod
+    def _active_links_by_key(db) -> dict[str, list[dict]]:
+        rows = db.execute(
+            "SELECT url,page_url,name,link_key FROM timetable_links WHERE active=1"
+        ).fetchall()
+        links_by_key: dict[str, list[dict]] = {}
+        for row in rows:
+            link = dict(row)
+            key = link["link_key"] or timetable_link_key(
+                link["page_url"], link["name"], link["url"]
+            )
+            links_by_key.setdefault(key, []).append(link)
+        return links_by_key
+
+    @staticmethod
+    def _with_current_source_urls(rows, links_by_key: dict[str, list[dict]]) -> list[dict]:
+        integrations = []
+        for row in rows:
+            integration = dict(row)
+            matches = links_by_key.get(integration["timetable_link_key"], [])
+            integration["source_url"] = matches[0]["url"] if len(matches) == 1 else None
+            integrations.append(integration)
+        return integrations
 
     def get_user_by_email(self, email: str) -> dict | None:
         with self.database.read() as db:
@@ -125,26 +164,53 @@ class Repository:
             args = (integration_id, user_id)
         with self.database.read() as db:
             row = db.execute(sql, args).fetchone()
-        return dict(row) if row else None
+            links_by_key = self._active_links_by_key(db)
+        return self._with_current_source_urls([row], links_by_key)[0] if row else None
 
     def all_source_urls(self) -> list[str]:
         with self.database.read() as db:
-            rows = db.execute("SELECT DISTINCT source_url FROM integrations").fetchall()
-        return [row["source_url"] for row in rows]
+            integrations = db.execute(
+                "SELECT timetable_link_key FROM integrations"
+            ).fetchall()
+            links_by_key = self._active_links_by_key(db)
+        return sorted({
+            links_by_key[row["timetable_link_key"]][0]["url"]
+            for row in integrations
+            if len(links_by_key.get(row["timetable_link_key"], [])) == 1
+        })
 
     def integrations_for_source(self, source_url: str) -> list[dict]:
         with self.database.read() as db:
-            rows = db.execute("SELECT * FROM integrations WHERE source_url=?", (source_url,)).fetchall()
-        return [dict(row) for row in rows]
+            link = db.execute(
+                "SELECT page_url,name,link_key FROM timetable_links WHERE url=? AND active=1",
+                (source_url,),
+            ).fetchone()
+            if not link:
+                return []
+            key = link["link_key"] or timetable_link_key(
+                link["page_url"], link["name"], source_url
+            )
+            links_by_key = self._active_links_by_key(db)
+            matches = links_by_key.get(key, [])
+            if len(matches) != 1 or matches[0]["url"] != source_url:
+                return []
+            rows = db.execute(
+                "SELECT * FROM integrations WHERE timetable_link_key=?", (key,)
+            ).fetchall()
+        return self._with_current_source_urls(rows, links_by_key)
 
-    def create_integration(self, *, user_id: str, source_url: str, group_number: int, calendar_id: str, calendar_name: str) -> dict:
+    def create_integration(
+        self, *, user_id: str, timetable_link_key: str, group_number: int,
+        calendar_id: str, calendar_name: str,
+    ) -> dict:
         integration_id = str(uuid.uuid4())
         now = utc_now()
         with self.database.transaction(immediate=True) as db:
             db.execute(
-                """INSERT INTO integrations(id,user_id,source_url,group_number,calendar_id,calendar_name,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (integration_id, user_id, source_url, group_number, calendar_id, calendar_name, now, now),
+                """INSERT INTO integrations(
+                       id,user_id,timetable_link_key,group_number,calendar_id,calendar_name,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (integration_id, user_id, timetable_link_key, group_number, calendar_id, calendar_name, now, now),
             )
         return self.get_integration(integration_id, user_id)
 
@@ -238,15 +304,29 @@ class Repository:
         result["parsed"] = json.loads(result.pop("parsed_json"))
         return result
 
+    def cache_missing_source(self, source_url: str, status: int) -> None:
+        now = utc_now()
+        missing = {"available": False, "http_status": status}
+        with self.database.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO source_cache(source_url,fetched_at,content_sha256,parsed_json,availability,http_status)
+                   VALUES(?,?,?,?, 'missing', ?)
+                   ON CONFLICT(source_url) DO UPDATE SET fetched_at=excluded.fetched_at,
+                     content_sha256=excluded.content_sha256,parsed_json=excluded.parsed_json,
+                     availability='missing',http_status=excluded.http_status""",
+                (source_url, now, f"http-{status}", json.dumps(missing, separators=(",", ":")), status),
+            )
+
     def upsert_source_cache(self, source_url: str, digest: str, parsed: dict) -> bool:
         now = utc_now()
         with self.database.transaction(immediate=True) as db:
             prior = db.execute("SELECT content_sha256 FROM source_cache WHERE source_url=?", (source_url,)).fetchone()
             changed = not prior or prior["content_sha256"] != digest
             db.execute(
-                """INSERT INTO source_cache(source_url,fetched_at,content_sha256,parsed_json)
-                   VALUES(?,?,?,?) ON CONFLICT(source_url) DO UPDATE SET fetched_at=excluded.fetched_at,
-                   content_sha256=excluded.content_sha256,parsed_json=excluded.parsed_json""",
+                """INSERT INTO source_cache(source_url,fetched_at,content_sha256,parsed_json,availability,http_status)
+                   VALUES(?,?,?,?, 'available', NULL) ON CONFLICT(source_url) DO UPDATE SET fetched_at=excluded.fetched_at,
+                   content_sha256=excluded.content_sha256,parsed_json=excluded.parsed_json,
+                   availability='available',http_status=NULL""",
                 (source_url, now, digest, json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))),
             )
         return changed
@@ -270,45 +350,167 @@ class Repository:
 
     def timetable_links(self, query: str = "", limit: int = 1000) -> list[dict]:
         sql = (
-            "SELECT url,href_label,programme,page_url,format_id,last_seen_at "
-            "FROM timetable_links WHERE active=1"
+            "SELECT l.url,l.name,l.programme,l.page_url,l.parser_key,l.link_key,l.last_seen_at,"
+            "m.degree,m.study_year,m.study_mode "
+            "FROM timetable_links l JOIN timetable_link_matchers m ON m.id=l.link_key WHERE l.active=1"
         )
         args: list = []
         if query.strip():
-            sql += " AND (href_label LIKE ? OR programme LIKE ? OR url LIKE ?)"
+            sql += " AND (l.name LIKE ? OR m.degree LIKE ? OR l.url LIKE ?)"
             term = f"%{query.strip()}%"
             args.extend((term, term, term))
-        sql += " ORDER BY programme COLLATE NOCASE,href_label COLLATE NOCASE LIMIT ?"
+        sql += " ORDER BY m.degree COLLATE NOCASE,m.study_year,m.study_mode LIMIT ?"
         args.append(max(1, min(limit, 2000)))
         with self.database.read() as db:
             rows = db.execute(sql, args).fetchall()
+        links = [dict(row) for row in rows]
+        for link in links:
+            if not link["link_key"]:
+                link["link_key"] = timetable_link_key(
+                    link["page_url"], link["name"], link["url"]
+                )
+        return links
+
+    def active_timetable_link_by_key(self, key: str) -> dict | None:
+        with self.database.read() as db:
+            rows = db.execute(
+                """SELECT l.url,l.name,l.programme,l.page_url,l.parser_key,l.link_key,
+                          m.degree,m.study_year,m.study_mode,m.availability
+                   FROM timetable_links l JOIN timetable_link_matchers m ON m.id=l.link_key
+                   WHERE l.active=1 AND l.link_key=?""",
+                (key,),
+            ).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+
+    def timetable_plan_by_key(self, key: str) -> dict | None:
+        with self.database.read() as db:
+            row = db.execute(
+                """SELECT m.id AS link_key,m.degree,m.study_year,m.study_mode,m.availability,
+                          l.url,l.name,l.programme,l.page_url,l.parser_key
+                   FROM timetable_link_matchers m LEFT JOIN timetable_links l
+                     ON l.link_key=m.id AND l.active=1 WHERE m.id=?""",
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def timetable_plan_key_for_url(self, source_url: str) -> str | None:
+        with self.database.read() as db:
+            row = db.execute(
+                "SELECT link_key FROM timetable_links WHERE url=? ORDER BY active DESC LIMIT 1",
+                (source_url,),
+            ).fetchone()
+        return str(row["link_key"]) if row else None
+
+    def set_timetable_plan_availability(
+        self, link_key: str, available: bool, *, expected_url: str | None = None
+    ) -> list[dict]:
+        """Persist one availability transition and create at most one notice per owner."""
+        target = "available" if available else "missing"
+        now = utc_now()
+        notices = []
+        with self.database.transaction(immediate=True) as db:
+            plan = db.execute(
+                "SELECT availability FROM timetable_link_matchers WHERE id=?", (link_key,)
+            ).fetchone()
+            if not plan:
+                return []
+            if expected_url:
+                current = db.execute(
+                    "SELECT url FROM timetable_links WHERE link_key=? AND active=1", (link_key,)
+                ).fetchone()
+                if not current or current["url"] != expected_url:
+                    return []
+            if plan["availability"] == target:
+                return []
+            db.execute("UPDATE timetable_link_matchers SET availability=?,updated_at=? WHERE id=?", (target, now, link_key))
+            integrations = db.execute(
+                "SELECT id,user_id FROM integrations WHERE timetable_link_key=?", (link_key,)
+            ).fetchall()
+            for integration in integrations:
+                action = "plan_available" if available else "plan_missing"
+                message = (
+                    "Plan zajęć jest ponownie dostępny na stronie UMB."
+                    if available else "Plan zajęć nie jest obecnie dostępny na stronie UMB."
+                )
+                notice = {
+                    "id": str(uuid.uuid4()), "user_id": integration["user_id"],
+                    "integration_id": integration["id"], "action": action,
+                    "event_summary": "Plan UMB", "event_start": now,
+                    "message": message, "sync_trigger": "timetable_catalog",
+                    "created_at": now,
+                }
+                db.execute(
+                    """INSERT INTO notifications(id,user_id,integration_id,action,event_summary,event_start,message,sync_trigger,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    tuple(notice[key] for key in ("id","user_id","integration_id","action","event_summary","event_start","message","sync_trigger","created_at")),
+                )
+                notices.append(notice)
+        return notices
+
+    def timetable_parser_key(self, source_url: str) -> str | None:
+        with self.database.read() as db:
+            row = db.execute(
+                "SELECT parser_key FROM timetable_links WHERE url=? AND active=1",
+                (source_url,),
+            ).fetchone()
+        return row["parser_key"] if row else None
+
+    def timetable_revisions_by_key(self, key: str) -> list[dict]:
+        with self.database.read() as db:
+            rows = db.execute(
+                """SELECT url,name,programme,page_url,parser_key,link_key,last_modified
+                   FROM timetable_links WHERE link_key=? AND listed=1 ORDER BY url""",
+                (key,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
-    def replace_timetable_links(self, links: list[dict], complete: bool) -> None:
-        now = utc_now()
+    def select_timetable_revision(self, key: str, url: str, last_modified: str | None) -> None:
+        """Store a fresh HTTP validator and make the selected physical revision active."""
         with self.database.transaction(immediate=True) as db:
-            if complete:
-                db.execute("UPDATE timetable_links SET active=0")
-            db.executemany(
-                """INSERT INTO timetable_links(
-                       url,href_label,programme,page_url,format_id,discovered_at,last_seen_at,active
-                   ) VALUES(?,?,?,?,?,?,?,1)
-                   ON CONFLICT(url) DO UPDATE SET href_label=excluded.href_label,
-                       programme=excluded.programme,page_url=excluded.page_url,
-                       format_id=excluded.format_id,last_seen_at=excluded.last_seen_at,active=1""",
-                [
-                    (
-                        link["url"],
-                        link["href_label"],
-                        link["programme"],
-                        link["page_url"],
-                        link["format_id"],
-                        now,
-                        now,
-                    )
-                    for link in links
-                ],
+            db.execute(
+                "UPDATE timetable_links SET last_modified=? WHERE link_key=? AND url=? AND listed=1",
+                (last_modified, key, url),
             )
+            db.execute("UPDATE timetable_links SET active=0 WHERE link_key=?", (key,))
+            db.execute(
+                "UPDATE timetable_links SET active=1 WHERE link_key=? AND url=? AND listed=1",
+                (key, url),
+            )
+
+    def update_timetable_revision_dates(self, key: str, revisions: list[dict]) -> None:
+        with self.database.transaction(immediate=True) as db:
+            db.executemany(
+                "UPDATE timetable_links SET last_modified=? WHERE link_key=? AND url=? AND listed=1",
+                [(revision.get("last_modified"), key, revision["url"]) for revision in revisions],
+            )
+
+    def replace_timetable_links(
+        self, links: list[dict], complete: bool, selected_urls: dict[str, str] | None = None
+    ) -> None:
+        if not complete:
+            return
+        now = utc_now()
+        selected_urls = selected_urls or {}
+        with self.database.transaction(immediate=True) as db:
+            db.execute("UPDATE timetable_links SET active=0,listed=0")
+            for link in links:
+                active = int(selected_urls.get(str(link["link_key"])) == str(link["url"]))
+                db.execute(
+                    """INSERT INTO timetable_links(
+                       url,name,programme,page_url,parser_key,link_key,last_modified,
+                       discovered_at,last_seen_at,listed,active
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(url) DO UPDATE SET name=excluded.name,
+                       programme=excluded.programme,page_url=excluded.page_url,
+                       parser_key=excluded.parser_key,link_key=excluded.link_key,
+                       last_modified=excluded.last_modified,
+                       last_seen_at=excluded.last_seen_at,listed=1,active=excluded.active""",
+                    (
+                        link["url"], link["name"], link["programme"], link["page_url"],
+                        link["parser_key"], link["link_key"], link.get("last_modified"),
+                        now, now, 1, active,
+                    ),
+                )
 
     def get_calendar_events(self, integration_id: str) -> dict[str, dict]:
         with self.database.read() as db:
@@ -513,14 +715,26 @@ class Repository:
 
     def list_changelog(self, user_id: str) -> list[dict]:
         with self.database.read() as db:
-            rows = db.execute(
-                """SELECT DISTINCT c.source_url, c.parsed_json, i.calendar_name
-                   FROM source_cache c JOIN integrations i ON i.source_url=c.source_url
-                   WHERE i.user_id=? ORDER BY i.calendar_name""",
+            integrations = db.execute(
+                "SELECT * FROM integrations WHERE user_id=? ORDER BY calendar_name",
                 (user_id,),
             ).fetchall()
+            links_by_key = self._active_links_by_key(db)
         result = []
-        for row in rows:
+        for integration in self._with_current_source_urls(integrations, links_by_key):
+            source_url = integration["source_url"]
+            if not source_url:
+                continue
+            with self.database.read() as db:
+                row = db.execute(
+                    "SELECT parsed_json FROM source_cache WHERE source_url=?", (source_url,)
+                ).fetchone()
+            if not row:
+                continue
             parsed = json.loads(row["parsed_json"])
-            result.append({"calendar_name": row["calendar_name"], "source_url": row["source_url"], "entries": parsed.get("changelog", [])})
+            result.append({
+                "calendar_name": integration["calendar_name"],
+                "source_url": source_url,
+                "entries": parsed.get("changelog", []),
+            })
         return result

@@ -59,7 +59,7 @@ class LiveScheduleSystemTest(unittest.TestCase):
         with self.subTest(workbook=url):
             contents = asyncio.run(_download(url))
             self.assertTrue(contents.startswith(b"PK\x03\x04"), f"Not an XLSX workbook: {url}")
-            result = parse_workbook_for_url(contents, url)
+            result = parse_workbook_for_url(contents, url, parser_key="G0")
             events = result["events"]
             self.assertGreaterEqual(len(events), 100)
             self.assertLessEqual(len(events), 2000)

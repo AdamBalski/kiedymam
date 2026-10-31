@@ -67,8 +67,7 @@ def start_jobs(
     scheduler.add_job(
         timetable_catalog.refresh,
         "cron",
-        hour=0,
-        minute=0,
+        minute="*/30",
         timezone=ZoneInfo("Europe/Warsaw"),
         id="refresh-timetable-catalog",
         next_run_time=datetime.now(timezone.utc),
